@@ -1,0 +1,16 @@
+Relax filters ( plot top 30)
+expand plot 
+plot entire test
+plot trigger instead of lines
+increase interval to 20 sec
+SIGNED AND UNSIGNED ON SAME PLOT
+
+4: 126 forced and  very noisy
+5: 126 good
+6: 126 active, noisy, meh lookin
+7: 126 active but noisy
+8: 126 looks good
+9: 126 active noisy
+10: 126 forced, very noisy
+
+
