@@ -1,6 +1,8 @@
 # LKA Distance-to-Lane CAN Decoder (RAM 4500)
 
-This project is a Python-based workflow for **finding and visualizing the CAN signal that represents “distance to lane”** using a known LKA trigger message as a reference.
+This project is a Python-based workflow for **finding and visualizing the CAN signal that represents “distance to lane”** using a known LKA trigger message as a reference. 
+
+**ONLY TESTED ON A RAM 4500**
 
 We use CAN ID **0x275** (LKA trigger states) to detect when Lane Keep Assist becomes active, then search all other CAN messages for signals that become “alive” after that trigger.
 
@@ -206,22 +208,6 @@ This tends to surface signals that “wake up” right when LKA activates.
 
 ---
 
-## Interpreting the Candidate Plots
-
-Each candidate plot includes:
-
-- **Red** = unsigned u16 interpretation  
-- **Yellow** = signed i16 interpretation  
-- **Dark Blue (Right Axis)** = 0x275 trigger state overlay  
-
-You are looking for a signal that:
-
-- changes smoothly over time
-- resembles lateral distance behavior (often near zero with positive/negative drift)
-- responds during ON states and is less active when OFF
-
----
-
 ## Notes / Current Findings
 
 Across testing:
@@ -234,6 +220,6 @@ Because of that, 0x126 is always plotted for every test.
 
 ---
 
-## Author / Project Context
+## Project Context
 
 This script is built for CAN decoding experiments on a RAM 4500, using LKA trigger state CAN messages to reverse-engineer the distance-to-lane signal.
