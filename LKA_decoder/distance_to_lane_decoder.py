@@ -362,6 +362,26 @@ def u16_series_for_candidate(df, can_id_dec, byte_pair_str, endian):
     out = pd.DataFrame({"Timestamp": g["Timestamp"].values, "u16": u16}).dropna()
     return out if len(out) > 10 else None
 
+def smooth_array(y: np.ndarray, method: str = "rolling", window: int = 25, ema_span: int = 25) -> np.ndarray:
+    """
+    Smooth a numpy array using:
+      - rolling mean (window in samples)
+      - EMA (span in samples)
+    """
+    y = np.asarray(y, dtype=np.float64)
+
+    if len(y) < 5:
+        return y
+
+    s = pd.Series(y)
+
+    if method == "rolling":
+        return s.rolling(window=window, center=True, min_periods=1).mean().to_numpy()
+
+    if method == "ema":
+        return s.ewm(span=ema_span, adjust=False).mean().to_numpy()
+
+    return y  # fallback (no smoothing)
 
 # =========================
 # Plot candidates (whole test)
@@ -405,6 +425,9 @@ def plot_candidate_with_trigger_overlay(
     y_percentile_clip=(1, 99),
     fig_size=(16, 7),          # taller plot
     y_pad_frac=0.08,           # extra headroom (8%)
+    smooth=False,
+    smooth_method="rolling",   # "rolling" or "ema"
+    smooth_window=25,
     outpath: Optional[str] = None
 ):
     can_hex = cand_row["can_id_hex"]
@@ -463,6 +486,12 @@ def plot_candidate_with_trigger_overlay(
     u16_zoom = u16_vals[z1]
     i16_zoom = i16_vals[z1]
 
+    # Optional smoothing (apply AFTER zoom so window sizing is consistent)
+    if smooth:
+        u16_zoom = smooth_array(u16_zoom, method=smooth_method, window=smooth_window, ema_span=smooth_window)
+        i16_zoom = smooth_array(i16_zoom, method=smooth_method, window=smooth_window, ema_span=smooth_window)
+
+
     if len(t_zoom) < 5:
         print(f"Skipping {can_hex} {byte_pair} {endian}: not enough points in window.")
         return
@@ -500,7 +529,9 @@ def plot_candidate_with_trigger_overlay(
     ax2.set_ylabel(trig_label)
 
     # Title
-    ax1.set_title(f"{can_hex}  {byte_pair}  {endian}  (u16 + i16)  + Trigger Overlay")
+    smooth_tag = f"SMOOTH({smooth_method}, N={smooth_window})" if smooth else "RAW"
+    ax1.set_title(f"{can_hex}  {byte_pair}  {endian}  (u16 + i16)  + Trigger Overlay   [{smooth_tag}]")
+
 
     # Legends (left + right)
     ax1.legend(loc="upper left")
@@ -555,6 +586,9 @@ def prepare_clean_output_folder(root_outdir: str, csv_path: str) -> str:
             print(f"Warning: could not remove {p}: {e}")
 
     return outdir
+
+
+    
 
 
 # =========================
@@ -630,7 +664,6 @@ def main():
         })
 
     force_outpath = os.path.join(test_outdir, f"FORCED_{FORCE_CAN_ID:03x}_{best_row['byte_pair']}_{best_row['endian']}.png")
-
     plot_candidate_with_trigger_overlay(
         df=df,
         cand_row=best_row,
@@ -638,12 +671,25 @@ def main():
         zoom_mode="full",
         outpath=force_outpath
     )
-
     print(f"Saved forced 0x126 plot: {force_outpath}")
+
+    # Save smoothed version too
+    forced_outpath_smooth = os.path.join(test_outdir, f"FORCED_{FORCE_CAN_ID:03x}_{best_row['byte_pair']}_{best_row['endian']}_smoothed.png")
+
+    plot_candidate_with_trigger_overlay(
+        df=df,
+        cand_row=best_row,
+        trigger_bytes_df=trigger_df,
+        zoom_mode="full",
+        outpath=forced_outpath_smooth,
+        smooth=True,
+        smooth_method="rolling",   # or "ema"
+        smooth_window=25
+    )
 
 
     # Plot each candidate across whole test
-    for i in range(len(cands_unique)):
+    for i in range(len(cands_unique)): 
         row = cands_unique.iloc[i]
         can_hex = row["can_id_hex"].replace("0x", "")
         byte_pair = row["byte_pair"].replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
@@ -655,10 +701,23 @@ def main():
             cand_row=row,
             trigger_bytes_df=trigger_df,
             zoom_mode="full",
-            outpath=outpath
+            outpath=outpath,
+            smooth=False
         )
 
+        # Save smoothed version too
+        outpath_smooth = os.path.join(test_outdir, f"cand_{i:02d}_{can_hex}_{byte_pair}_{endian}_smoothed.png")
 
+        plot_candidate_with_trigger_overlay(
+            df=df,
+            cand_row=row,
+            trigger_bytes_df=trigger_df,
+            zoom_mode="full",
+            outpath=outpath_smooth,
+            smooth=True,
+            smooth_method="rolling",   # or "ema"
+            smooth_window=25
+        )
 
     print(f"Saved {len(cands_unique)} candidate plots to: {test_outdir}")
 

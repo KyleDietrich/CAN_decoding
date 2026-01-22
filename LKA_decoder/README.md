@@ -13,6 +13,7 @@ The goal is to narrow down candidate CAN IDs / byte pairs that behave like a dis
 Given a CAN log CSV, the script:
 
 ### 1) Loads and cleans CAN data
+
 - Reads the CSV exported from your CAN tool
 - Converts:
   - CAN Identifier hex → integer CAN ID
@@ -21,36 +22,45 @@ Given a CAN log CSV, the script:
 - Removes invalid rows (missing timestamp / invalid CAN_ID)
 
 ### 2) Extracts the LKA trigger states (CAN ID `0x275`)
+
 From ID **0x275** it pulls:
+
 - `Byte2_state`
 - `Byte7_state`
 
 These bytes appear to represent LKA trigger/command states.
 
 ### 3) Detects ON events
+
 An “ON event” is defined as:
+
 - `Byte7_state` transitioning into **0x04**
 
 These ON timestamps become our alignment reference.
 
 ### 4) Scores candidate signals across the full CAN bus
+
 For each CAN ID (excluding `0x275`), the script tests:
 
 Every 2-byte window (Byte1–Byte2 ... Byte7–Byte8)  
 Both byte orders:
+
 - **little endian**
 - **big endian**
 
 Each candidate is scored by comparing activity:
+
 - **before** trigger ON
 - **after** trigger ON
 
 A good candidate is:
+
 - significantly more active after ON
 - reasonably consistent across multiple ON events
 - not a pure counter / reset-like jump signal
 
 ### 5) Generates clear plots for candidates
+
 For each top candidate, the script produces one plot showing:
 
 - Candidate interpretation as **unsigned u16** (red)
@@ -60,6 +70,7 @@ For each top candidate, the script produces one plot showing:
 Plots cover **the entire test duration** (full timeline).
 
 ### 6) Always plots CAN ID `0x126`
+
 Even if it does not rank in the top candidate list, the script forces a plot for **CAN ID 0x126**, since testing suggests this ID may contain the distance-to-lane signal.
 
 ---
@@ -68,7 +79,7 @@ Even if it does not rank in the top candidate list, the script forces a plot for
 
 Typical structure:
 
-```
+```plaintext
 truck_CAN_decode/
 ├── distance_to_lane_decoder.py
 ├── README.md
@@ -125,7 +136,7 @@ python distance_to_lane_decoder.py \
 ### CLI Arguments
 
 | Argument | Description | Default |
-|---------|-------------|---------|
+| --------- | ------------- | --------- |
 | `--csv` | Path to CAN log CSV | **required** |
 | `--outdir` | Root folder for output plots/results | `lka_results` |
 | `--topn` | Number of top candidates to keep | `25` |
@@ -143,12 +154,16 @@ If the folder already exists, it is cleared and replaced with the new output.
 Inside the test folder you will find:
 
 ### `trigger_states_whole_test.png`
+
 A step plot of:
+
 - `0x275 Byte2`
 - `0x275 Byte7`
+
 With ON events marked.
 
 ### `top_candidates.csv`
+
 The ranked candidate table (after scoring) including:
 
 - CAN ID
@@ -161,9 +176,11 @@ The ranked candidate table (after scoring) including:
 - final score
 
 ### `cand_XX_*.png`
+
 Candidate plots for the ranked list (deduped to one best row per CAN ID).
 
 ### `FORCED_126_*.png`
+
 A forced plot for CAN ID **0x126** (best scoring byte-pair/endian if available, otherwise fallback).
 
 ---
@@ -198,6 +215,7 @@ Each candidate plot includes:
 - **Dark Blue (Right Axis)** = 0x275 trigger state overlay  
 
 You are looking for a signal that:
+
 - changes smoothly over time
 - resembles lateral distance behavior (often near zero with positive/negative drift)
 - responds during ON states and is less active when OFF
@@ -207,6 +225,7 @@ You are looking for a signal that:
 ## Notes / Current Findings
 
 Across testing:
+
 - CAN ID **0x220** appeared often in early scoring runs
 - CAN ID **0x102** appears in some tests
 - CAN ID **0x126** has emerged as a strong candidate and visually resembles expected distance behavior in multiple trials
