@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 
 from candidate_scoring import build_candidates_multi_event_relaxed, dedupe_by_can_id
 from on_event_sampling import build_on_event_sample_table
+from multi_byte_decoder import explore_decode_space_for_targets
 
 # =========================
 # Config
@@ -560,6 +561,66 @@ def main():
 
     print(f"Saved {len(cands_unique)} candidate plots to: {test_outdir}")
 
+    ranked = explore_decode_space_for_targets(
+        df=df,
+        on_events=on_events,
+        target_ids=[0x126, 0x220],
+        pre_window=args.pre,
+        post_window=args.post,
+    )
+
+    # --------------------------
+    # Save + plot the explored decode configs
+    # - Save exploration CSV inside a subfolder within the test folder
+    # - Plot TOP 15 explored options for BOTH 0x126 and 0x220
+    # --------------------------
+    explore_outdir = os.path.join(test_outdir, "explore_decode_space")
+    os.makedirs(explore_outdir, exist_ok=True)
+
+    explore_csv = os.path.join(explore_outdir, "multi_byte_ranked_126_220.csv")
+    ranked.to_csv(explore_csv, index=False)
+    print(f"Saved multi-byte exploration ranked table: {explore_csv}")
+    print(ranked.head(20))
+
+    for cid in [0x126, 0x220]:
+        top_df = ranked[ranked["can_id_dec"].astype(int) == int(cid)].head(15).reset_index(drop=True)
+        if top_df.empty:
+            print(f"[WARN] No explore results for {hex(cid)}")
+            continue
+
+        for rank in range(len(top_df)):
+            row = top_df.iloc[rank]
+
+            out_raw = os.path.join(explore_outdir, f"EXPLORE_{cid:03x}_top{rank+1:02d}_raw.png")
+            out_smooth = os.path.join(explore_outdir, f"EXPLORE_{cid:03x}_top{rank+1:02d}_smoothed.png")
+
+            plot_from_explore_row(
+                df=df,
+                explore_row=row,
+                trigger_bytes_df=trigger_df,
+                outpath=out_raw,
+                smooth=False,
+            )
+
+            plot_from_explore_row(
+                df=df,
+                explore_row=row,
+                trigger_bytes_df=trigger_df,
+                outpath=out_smooth,
+                smooth=True,
+                smooth_method="rolling",
+                smooth_window=25,
+            )
+
+    plot_three_decodes_same_axis(
+        df=df,
+        can_id=0x126,
+        smooth=True,
+        smooth_method="rolling",
+        smooth_window=25,
+        outpath="decode_compare_126.png"
+    )
+        
 
 if __name__ == "__main__":
     main()
