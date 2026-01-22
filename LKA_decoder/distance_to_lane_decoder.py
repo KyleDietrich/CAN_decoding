@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from candidate_scoring import build_candidates_multi_event_relaxed, dedupe_by_can_id
 from on_event_sampling import build_on_event_sample_table
 from multi_byte_decoder import explore_decode_space_for_targets
+from plotting_utils import plot_from_explore_row
 
 # =========================
 # Config
@@ -611,15 +612,6 @@ def main():
                 smooth_method="rolling",
                 smooth_window=25,
             )
-
-    plot_three_decodes_same_axis(
-        df=df,
-        can_id=0x126,
-        smooth=True,
-        smooth_method="rolling",
-        smooth_window=25,
-        outpath="decode_compare_126.png"
-    )
         
 
 if __name__ == "__main__":
