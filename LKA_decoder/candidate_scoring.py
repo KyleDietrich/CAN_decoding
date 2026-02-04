@@ -127,13 +127,21 @@ def get_i16_series_for_candidate(
 def build_candidates_multi_event_relaxed(
     df: pd.DataFrame,
     on_events: List[float],
-    exclude_id: int,
+    exclude_id: Optional[int] = None,
     pre_window: float = 20.0,
     post_window: float = 20.0,
     top_n: int = 25,
 ) -> pd.DataFrame:
     """
     Rank CAN_ID + bytepair + endian candidates based on activity AFTER trigger ON events.
+    
+    Args:
+        df: Full CAN dataframe
+        on_events: List of trigger event timestamps
+        exclude_id: CAN ID to exclude from search (None to include all IDs)
+        pre_window: Seconds before trigger to analyze
+        post_window: Seconds after trigger to analyze
+        top_n: Number of top candidates to return
     """
     if len(on_events) == 0:
         raise ValueError("No ON events found (trigger ON list is empty).")
@@ -142,7 +150,8 @@ def build_candidates_multi_event_relaxed(
     eps = 1e-6
 
     for can_id, g in df.groupby("CAN_ID"):
-        if int(can_id) == int(exclude_id):
+        # Skip excluded ID if specified
+        if exclude_id is not None and int(can_id) == int(exclude_id):
             continue
         if len(g) < 150:
             continue

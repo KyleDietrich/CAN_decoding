@@ -9,16 +9,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from candidate_scoring import build_candidates_multi_event_relaxed, dedupe_by_can_id
-from on_event_sampling import build_on_event_sample_table
-from multi_byte_decoder import explore_decode_space_for_targets
-from plotting_utils import plot_from_explore_row
 
 # =========================
 # Config
 # =========================
-LKA_ID = 0x275
-TRIGGER_ON_VALUE = 0x04
-
 BYTE_COLS = [f"Byte{i}" for i in range(1, 9)]
 
 
@@ -47,7 +41,22 @@ def hex_to_int(x):
     except Exception:
         return np.nan
 
+def parse_hex_arg(val: str) -> int:
+    """
+    Parse a hex string argument (e.g., '0x670', '670', '0x11') to int.
+    """
+    val = val.strip().lower()
+    if val.startswith("0x"):
+        return int(val, 16)
+    else:
+        return int(val, 16)
 
+def parse_hex_args(vals: List[str]) -> List[int]:
+    """
+    Parse multiple hex string arguments to list of ints.
+    """
+    return [parse_hex_arg(v) for v in vals]
+    
 def u16_to_i16(u16_vals: np.ndarray) -> np.ndarray:
     u = np.asarray(u16_vals, dtype=np.float64)
     return np.where(u >= 32768, u - 65536, u)
@@ -117,58 +126,75 @@ def load_and_clean_csv(csv_path: str) -> pd.DataFrame:
 
 
 # =========================
-# Trigger extraction: 0x275 Byte2 + Byte7
+# Trigger extraction: parameterized
 # =========================
-def compute_trigger_bytes(df, lka_id=0x275):
+def compute_trigger_bytes(df: pd.DataFrame, lka_id: int, trigger_byte: int) -> pd.DataFrame:
+    """
+    Extract trigger byte values for the specified LKA CAN ID.
+    
+    Args:
+        df: Full CAN dataframe
+        lka_id: The CAN ID to use as trigger (e.g., 0x670)
+        trigger_byte: Which byte (1-8) contains the trigger value
+    
+    Returns:
+        DataFrame with Timestamp and trigger byte state
+    """
     lka = df[df["CAN_ID"] == int(lka_id)].copy().sort_values("Timestamp")
     if lka.empty:
         raise ValueError(f"No rows found for LKA CAN ID = {hex(lka_id)}")
 
+    byte_col = f"Byte{trigger_byte}"
+    
     out = pd.DataFrame({
         "Timestamp": lka["Timestamp"].values,
-        "Byte2_state": pd.to_numeric(lka["Byte2"], errors="coerce"),
-        "Byte7_state": pd.to_numeric(lka["Byte7"], errors="coerce"),
+        "trigger_byte_state": pd.to_numeric(lka[byte_col], errors="coerce"),
     }).dropna()
 
-    out["Byte2_state"] = out["Byte2_state"].astype(int)
-    out["Byte7_state"] = out["Byte7_state"].astype(int)
+    out["trigger_byte_state"] = out["trigger_byte_state"].astype(int)
 
     return out
 
-
-def detect_on_events(trigger_df: pd.DataFrame, on_value: int = TRIGGER_ON_VALUE) -> List[float]:
+def detect_on_events(trigger_df: pd.DataFrame, on_values: List[int]) -> List[float]:
     """
-    ON event = Byte7 transitions into 0x04.
+    ON event = trigger byte transitions into any of the specified on_values.
     """
-    s = trigger_df["Byte7_state"].values
+    s = trigger_df["trigger_byte_state"].values
     t = trigger_df["Timestamp"].values
 
     prev = np.roll(s, 1)
     prev[0] = s[0]
 
-    on_mask = (s == on_value) & (prev != on_value)
+    # Trigger on ANY of the values in on_values
+    on_mask = np.isin(s, on_values) & ~np.isin(prev, on_values)
     return t[on_mask].astype(float).tolist()
 
 
 # =========================
 # Plot triggers (whole test)
 # =========================
-def plot_trigger_states_whole_test(trigger_df: pd.DataFrame, on_events: List[float], outpath: str):
+def plot_trigger_states_whole_test(
+    trigger_df: pd.DataFrame, 
+    on_events: List[float], 
+    outpath: str,
+    lka_id: int,
+    trigger_byte: int,
+    trigger_values: List[int]
+):
     t = trigger_df["Timestamp"].values
-    b2 = trigger_df["Byte2_state"].values
-    b7 = trigger_df["Byte7_state"].values
+    trigger_state = trigger_df["trigger_byte_state"].values
 
     fig, ax = plt.subplots(figsize=(16, 3))
 
-    ax.step(t, b2, where="post", linewidth=1.2, label="0x275 Byte2")
-    ax.step(t, b7, where="post", linewidth=1.2, label="0x275 Byte7")
+    ax.step(t, trigger_state, where="post", linewidth=1.2, label=f"{hex(lka_id)} Byte{trigger_byte}")
 
     for et in on_events:
         ax.axvline(et, color="red", linestyle="--", linewidth=1.5)
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Trigger State (byte value)")
-    ax.set_title("LKA Trigger States from 0x275 (Byte2 + Byte7), ON events marked red")
+    values_str = ", ".join(hex(v) for v in trigger_values)
+    ax.set_title(f"LKA Trigger States from {hex(lka_id)} Byte{trigger_byte}, ON events (-> {values_str}) marked red")
     ax.grid(True, linewidth=0.5)
     ax.legend(loc="upper right")
     fig.tight_layout()
@@ -210,20 +236,6 @@ def smooth_array(y: np.ndarray, method: str = "rolling", window: int = 25, ema_s
 
     return y  # fallback (no smoothing)
 
-# =========================
-# Plot candidates (whole test)
-# unsigned u16 red, signed i16 yellow
-# =========================
-def candidate_series_u16(df: pd.DataFrame, can_id_dec: int, offset: int, endian: str) -> Optional[pd.DataFrame]:
-    g = df[df["CAN_ID"] == int(can_id_dec)].copy().sort_values("Timestamp")
-    if g.empty:
-        return None
-
-    u16 = compute_u16_series_from_group(g, offset, endian)
-    out = pd.DataFrame({"Timestamp": g["Timestamp"].values, "u16": u16}).dropna()
-    if len(out) < 50:
-        return None
-    return out
 
 def pick_best_row_for_can_id(cands_df: pd.DataFrame, target_can_id: int) -> Optional[pd.Series]:
     """
@@ -245,15 +257,17 @@ def plot_candidate_with_trigger_overlay(
     df,
     cand_row,
     trigger_bytes_df,
-    zoom_mode="full",          # "full" or "auto"
+    lka_id: int,
+    trigger_byte: int,
+    trigger_values: List[int],
+    zoom_mode="full",
     pad_seconds=10,
-    prefer_trigger="Byte7",    # "Byte7" or "Byte2" or "either"
     on_value=0x04,
     y_percentile_clip=(1, 99),
-    fig_size=(16, 7),          # taller plot
-    y_pad_frac=0.08,           # extra headroom (8%)
+    fig_size=(16, 7),
+    y_pad_frac=0.08,
     smooth=False,
-    smooth_method="rolling",   # "rolling" or "ema"
+    smooth_method="rolling",
     smooth_window=25,
     outpath: Optional[str] = None
 ):
@@ -264,28 +278,23 @@ def plot_candidate_with_trigger_overlay(
 
     # Candidate signal (u16 raw)
     s = u16_series_for_candidate(df, can_id, byte_pair, endian)
+    if s is None:
+        print(f"Skipping {can_hex} {byte_pair} {endian}: not enough data.")
+        return
+        
     t = s["Timestamp"].values
     u16_vals = s["u16"].values
 
     # Compute both interpretations
     i16_vals = u16_to_i16(u16_vals)
 
-    # Trigger series (Byte7/Byte2)
+    # Trigger series
     tb = trigger_bytes_df.sort_values("Timestamp").copy()
     tt = tb["Timestamp"].values
-
-    if prefer_trigger == "Byte7":
-        trig = tb["Byte7_state"].values
-        trig_label = "0x275 Byte7"
-        on_mask = (tb["Byte7_state"].values == on_value)
-    elif prefer_trigger == "Byte2":
-        trig = tb["Byte2_state"].values
-        trig_label = "0x275 Byte2"
-        on_mask = (tb["Byte2_state"].values == on_value)
-    else:
-        trig = ((tb["Byte7_state"].values == on_value) | (tb["Byte2_state"].values == on_value)).astype(int)
-        trig_label = "0x275 ON mask"
-        on_mask = (trig == 1)
+    trig = tb["trigger_byte_state"].values
+    trig_label = f"{hex(lka_id)} Byte{trigger_byte}"
+    
+    on_mask = np.isin(tb["trigger_byte_state"].values, trigger_values)
 
     # Decide plot window
     if zoom_mode == "auto":
@@ -300,10 +309,9 @@ def plot_candidate_with_trigger_overlay(
         tmin = float(np.nanmin(t))
         tmax = float(np.nanmax(t))
 
-        x_pad = 0.02 * (tmax - tmin)   # 2% padding on both sides
+        x_pad = 0.02 * (tmax - tmin)
         tmin -= x_pad
         tmax += x_pad
-
 
     # Zoom masks
     z1 = (t >= tmin) & (t <= tmax)
@@ -313,17 +321,16 @@ def plot_candidate_with_trigger_overlay(
     u16_zoom = u16_vals[z1]
     i16_zoom = i16_vals[z1]
 
-    # Optional smoothing (apply AFTER zoom so window sizing is consistent)
+    # Optional smoothing
     if smooth:
         u16_zoom = smooth_array(u16_zoom, method=smooth_method, window=smooth_window, ema_span=smooth_window)
         i16_zoom = smooth_array(i16_zoom, method=smooth_method, window=smooth_window, ema_span=smooth_window)
-
 
     if len(t_zoom) < 5:
         print(f"Skipping {can_hex} {byte_pair} {endian}: not enough points in window.")
         return
 
-    # Y-limits based on both series combined (prevents clipping)
+    # Y-limits based on both series combined
     combined = np.concatenate([u16_zoom[np.isfinite(u16_zoom)], i16_zoom[np.isfinite(i16_zoom)]])
     if len(combined) > 20:
         lo, hi = np.nanpercentile(combined, y_percentile_clip)
@@ -332,7 +339,7 @@ def plot_candidate_with_trigger_overlay(
         y_min = float(np.nanmin(combined))
         y_max = float(np.nanmax(combined))
 
-    # Add headroom padding so it doesn't slam into the top/bottom
+    # Add headroom padding
     y_rng = max(1e-9, (y_max - y_min))
     y_min = y_min - y_pad_frac * y_rng
     y_max = y_max + y_pad_frac * y_rng
@@ -340,7 +347,6 @@ def plot_candidate_with_trigger_overlay(
     # ---- Plot ----
     fig, ax1 = plt.subplots(figsize=fig_size)
 
-    # Unsigned (red) + signed (yellow) on same axis
     ax1.plot(t_zoom, u16_zoom, color="red", linewidth=1.0, label="Candidate unsigned u16")
     ax1.plot(t_zoom, i16_zoom, color="gold", linewidth=1.0, label="Candidate signed i16")
 
@@ -359,8 +365,7 @@ def plot_candidate_with_trigger_overlay(
     smooth_tag = f"SMOOTH({smooth_method}, N={smooth_window})" if smooth else "RAW"
     ax1.set_title(f"{can_hex}  {byte_pair}  {endian}  (u16 + i16)  + Trigger Overlay   [{smooth_tag}]")
 
-
-    # Legends (left + right)
+    # Legends
     ax1.legend(loc="upper left")
     ax2.legend(loc="upper right")
 
@@ -376,7 +381,7 @@ def plot_candidate_with_trigger_overlay(
 def infer_test_folder_name(csv_path: str) -> str:
     """
     Tries to infer a folder name like 'Test_4' from the CSV filename.
-    If it can't find one, it falls back to the base filename (sanitized).
+    If it can't find one, it falls back to the base filename.
     """
     base = os.path.splitext(os.path.basename(csv_path))[0]
 
@@ -419,13 +424,44 @@ def prepare_clean_output_folder(root_outdir: str, csv_path: str) -> str:
 # Main
 # =========================
 def main():
-    parser = argparse.ArgumentParser(description="Find distance-like CAN candidates using LKA trigger 0x275 Byte7.")
+    parser = argparse.ArgumentParser(
+        description="Find distance-like CAN candidates using LKA trigger events.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Kenworth with trigger on 0x670 Byte1, value 0x11 (right lane departure)
+  python distance_to_lane_decoder.py --csv data.csv --lka-can-id 0x670 --trigger-byte 1 --trigger-value 0x11
+
+  # RAM 4500 with trigger on 0x275 Byte7, value 0x04
+  python distance_to_lane_decoder.py --csv data.csv --lka-can-id 0x275 --trigger-byte 7 --trigger-value 0x04
+        """
+    )
     parser.add_argument("--csv", required=True, help="Path to the CSV log file")
     parser.add_argument("--outdir", default="lka_results", help="Output directory for plots/results")
     parser.add_argument("--topn", type=int, default=25, help="Number of top candidates to keep")
     parser.add_argument("--pre", type=float, default=8.0, help="Pre-window seconds for scoring")
     parser.add_argument("--post", type=float, default=8.0, help="Post-window seconds for scoring")
+    
+    # New parameterized trigger arguments
+    parser.add_argument("--lka-can-id", required=True, 
+                        help="CAN ID for LKA trigger (hex, e.g., 0x670 or 670)")
+    parser.add_argument("--trigger-byte", type=int, required=True, choices=range(1, 9),
+                        help="Which byte (1-8) contains the trigger value")
+    parser.add_argument("--trigger-value", required=True, nargs='+',
+                    help="Value(s) that indicate trigger ON (hex, e.g., 0x11 or '0x11 0x44' for multiple)")
+    
     args = parser.parse_args()
+
+    # Parse hex arguments
+    lka_id = parse_hex_arg(args.lka_can_id)
+    trigger_values = parse_hex_args(args.trigger_value)  # Now a list
+    trigger_byte = args.trigger_byte
+
+    print(f"Configuration:")
+    print(f"  LKA CAN ID: {hex(lka_id)}")
+    print(f"  Trigger Byte: {trigger_byte}")
+    print(f"  Trigger Value(s): {[hex(v) for v in trigger_values]}")
+    print()
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -437,21 +473,31 @@ def main():
     df = load_and_clean_csv(args.csv)
 
     # Trigger states + ON events
-    trigger_df = compute_trigger_bytes(df, lka_id=LKA_ID)
-    on_events = detect_on_events(trigger_df, on_value=TRIGGER_ON_VALUE)
+    trigger_df = compute_trigger_bytes(df, lka_id=lka_id, trigger_byte=trigger_byte)
+    on_events = detect_on_events(trigger_df, on_values=trigger_values)
 
-    print(f"Found {len(on_events)} ON events (Byte7 -> {hex(TRIGGER_ON_VALUE)})")
+    print(f"Found {len(on_events)} ON events (Byte{trigger_byte} -> {[hex(v) for v in trigger_values]})")
+
+    if len(on_events) == 0:
+        print("WARNING: No trigger events found! Check your --lka-can-id, --trigger-byte, and --trigger-value settings.")
+        print(f"Sample values from {hex(lka_id)} Byte{trigger_byte}:")
+        sample_vals = trigger_df["trigger_byte_state"].value_counts().head(10)
+        print(sample_vals)
+        return
 
     # Trigger plot (whole test)
     trigger_plot_path = os.path.join(test_outdir, "trigger_states_whole_test.png")
-    plot_trigger_states_whole_test(trigger_df, on_events, trigger_plot_path)
+    plot_trigger_states_whole_test(
+        trigger_df, on_events, trigger_plot_path,
+        lka_id=lka_id, trigger_byte=trigger_byte, trigger_values=trigger_values
+    )
     print(f"Saved trigger plot: {trigger_plot_path}")
 
-    # Candidate scoring (relaxed)
+    # Candidate scoring - NOTE: exclude_id=None to INCLUDE the trigger CAN ID in search
     cands = build_candidates_multi_event_relaxed(
         df=df,
         on_events=on_events,
-        exclude_id=LKA_ID,
+        exclude_id=None,  # Include trigger CAN ID in search
         pre_window=args.pre,
         post_window=args.post,
         top_n=args.topn,
@@ -470,67 +516,8 @@ def main():
     cands_unique = dedupe_by_can_id(cands, score_col="final_score")
     print(f"Unique CAN IDs in top list: {len(cands_unique)}")
 
-    # --------------------------
-    # Grab signed i16 values at each ON event for 0x126 and 0x220
-    # --------------------------
-    sample_table = build_on_event_sample_table(
-        df=df,
-        trigger_df=trigger_df,
-        on_events=on_events,
-        target_ids=[0x126, 0x220]
-    )
-
-    sample_csv = os.path.join(test_outdir, "on_event_signed_samples_126_220.csv")
-    sample_table.to_csv(sample_csv, index=False)
-    print(f"Saved ON-event signed sample table: {sample_csv}")
-    print("\nSigned values at ON events:")
-    print(sample_table)
-
-
-    # --------------------------
-    # ALWAYS plot a specific CAN ID (even if it’s not in top candidates)
-    # --------------------------
-    FORCE_CAN_ID = 0x126
-
-    best_row = pick_best_row_for_can_id(cands, FORCE_CAN_ID)
-
-    if best_row is None:
-        print("0x126 not found in ranked candidates — plotting fallback Byte1-Byte2 little.")
-        best_row = pd.Series({
-            "can_id_hex": hex(FORCE_CAN_ID),
-            "can_id_dec": FORCE_CAN_ID,
-            "byte_pair": "(Byte1,Byte2)",
-            "endian": "little",
-            "final_score": -1,
-        })
-
-    force_outpath = os.path.join(test_outdir, f"FORCED_{FORCE_CAN_ID:03x}_{best_row['byte_pair']}_{best_row['endian']}.png")
-    plot_candidate_with_trigger_overlay(
-        df=df,
-        cand_row=best_row,
-        trigger_bytes_df=trigger_df,
-        zoom_mode="full",
-        outpath=force_outpath
-    )
-    print(f"Saved forced 0x126 plot: {force_outpath}")
-
-    # Save smoothed version too
-    forced_outpath_smooth = os.path.join(test_outdir, f"FORCED_{FORCE_CAN_ID:03x}_{best_row['byte_pair']}_{best_row['endian']}_smoothed.png")
-
-    plot_candidate_with_trigger_overlay(
-        df=df,
-        cand_row=best_row,
-        trigger_bytes_df=trigger_df,
-        zoom_mode="full",
-        outpath=forced_outpath_smooth,
-        smooth=True,
-        smooth_method="rolling",   # or "ema"
-        smooth_window=25
-    )
-
-
     # Plot each candidate across whole test
-    for i in range(len(cands_unique)): 
+    for i in range(len(cands_unique)):
         row = cands_unique.iloc[i]
         can_hex = row["can_id_hex"].replace("0x", "")
         byte_pair = row["byte_pair"].replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
@@ -541,6 +528,9 @@ def main():
             df=df,
             cand_row=row,
             trigger_bytes_df=trigger_df,
+            lka_id=lka_id,
+            trigger_byte=trigger_byte,
+            trigger_values=trigger_values,
             zoom_mode="full",
             outpath=outpath,
             smooth=False
@@ -553,66 +543,18 @@ def main():
             df=df,
             cand_row=row,
             trigger_bytes_df=trigger_df,
+            lka_id=lka_id,
+            trigger_byte=trigger_byte,
+            trigger_values=trigger_values,
             zoom_mode="full",
             outpath=outpath_smooth,
             smooth=True,
-            smooth_method="rolling",   # or "ema"
+            smooth_method="rolling",
             smooth_window=25
         )
 
     print(f"Saved {len(cands_unique)} candidate plots to: {test_outdir}")
 
-    ranked = explore_decode_space_for_targets(
-        df=df,
-        on_events=on_events,
-        target_ids=[0x126, 0x220],
-        pre_window=args.pre,
-        post_window=args.post,
-    )
-
-    # --------------------------
-    # Save + plot the explored decode configs
-    # - Save exploration CSV inside a subfolder within the test folder
-    # - Plot TOP 15 explored options for BOTH 0x126 and 0x220
-    # --------------------------
-    explore_outdir = os.path.join(test_outdir, "explore_decode_space")
-    os.makedirs(explore_outdir, exist_ok=True)
-
-    explore_csv = os.path.join(explore_outdir, "multi_byte_ranked_126_220.csv")
-    ranked.to_csv(explore_csv, index=False)
-    print(f"Saved multi-byte exploration ranked table: {explore_csv}")
-    print(ranked.head(20))
-
-    for cid in [0x126, 0x220]:
-        top_df = ranked[ranked["can_id_dec"].astype(int) == int(cid)].head(15).reset_index(drop=True)
-        if top_df.empty:
-            print(f"[WARN] No explore results for {hex(cid)}")
-            continue
-
-        for rank in range(len(top_df)):
-            row = top_df.iloc[rank]
-
-            out_raw = os.path.join(explore_outdir, f"EXPLORE_{cid:03x}_top{rank+1:02d}_raw.png")
-            out_smooth = os.path.join(explore_outdir, f"EXPLORE_{cid:03x}_top{rank+1:02d}_smoothed.png")
-
-            plot_from_explore_row(
-                df=df,
-                explore_row=row,
-                trigger_bytes_df=trigger_df,
-                outpath=out_raw,
-                smooth=False,
-            )
-
-            plot_from_explore_row(
-                df=df,
-                explore_row=row,
-                trigger_bytes_df=trigger_df,
-                outpath=out_smooth,
-                smooth=True,
-                smooth_method="rolling",
-                smooth_window=25,
-            )
-        
 
 if __name__ == "__main__":
     main()
