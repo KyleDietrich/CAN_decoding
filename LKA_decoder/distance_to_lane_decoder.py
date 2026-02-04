@@ -9,6 +9,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from candidate_scoring import build_candidates_multi_event_relaxed, dedupe_by_can_id
+from plotting_utils import (
+    plot_trigger_states_whole_test,
+    plot_candidate_with_trigger_overlay,
+    u16_to_i16,
+)
+from multi_byte_decoder import explore_decode_space_for_targets
 
 # =========================
 # Config
@@ -56,10 +62,6 @@ def parse_hex_args(vals: List[str]) -> List[int]:
     Parse multiple hex string arguments to list of ints.
     """
     return [parse_hex_arg(v) for v in vals]
-    
-def u16_to_i16(u16_vals: np.ndarray) -> np.ndarray:
-    u = np.asarray(u16_vals, dtype=np.float64)
-    return np.where(u >= 32768, u - 65536, u)
 
 
 def compute_u16_series_from_group(g: pd.DataFrame, offset: int, endian: str) -> np.ndarray:
@@ -171,38 +173,8 @@ def detect_on_events(trigger_df: pd.DataFrame, on_values: List[int]) -> List[flo
 
 
 # =========================
-# Plot triggers (whole test)
+# Data helpers for candidates
 # =========================
-def plot_trigger_states_whole_test(
-    trigger_df: pd.DataFrame, 
-    on_events: List[float], 
-    outpath: str,
-    lka_id: int,
-    trigger_byte: int,
-    trigger_values: List[int]
-):
-    t = trigger_df["Timestamp"].values
-    trigger_state = trigger_df["trigger_byte_state"].values
-
-    fig, ax = plt.subplots(figsize=(16, 3))
-
-    ax.step(t, trigger_state, where="post", linewidth=1.2, label=f"{hex(lka_id)} Byte{trigger_byte}")
-
-    for et in on_events:
-        ax.axvline(et, color="red", linestyle="--", linewidth=1.5)
-
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Trigger State (byte value)")
-    values_str = ", ".join(hex(v) for v in trigger_values)
-    ax.set_title(f"LKA Trigger States from {hex(lka_id)} Byte{trigger_byte}, ON events (-> {values_str}) marked red")
-    ax.grid(True, linewidth=0.5)
-    ax.legend(loc="upper right")
-    fig.tight_layout()
-
-    fig.savefig(outpath, dpi=150)
-    plt.close(fig)
-
-
 def u16_series_for_candidate(df, can_id_dec, byte_pair_str, endian):
     b1 = int(byte_pair_str.split("Byte")[1].split(",")[0])  # 1-based
     offset = b1 - 1
@@ -214,170 +186,10 @@ def u16_series_for_candidate(df, can_id_dec, byte_pair_str, endian):
     u16 = compute_u16_series_from_group(g, offset, endian)
     out = pd.DataFrame({"Timestamp": g["Timestamp"].values, "u16": u16}).dropna()
     return out if len(out) > 10 else None
-
-def smooth_array(y: np.ndarray, method: str = "rolling", window: int = 25, ema_span: int = 25) -> np.ndarray:
-    """
-    Smooth a numpy array using:
-      - rolling mean (window in samples)
-      - EMA (span in samples)
-    """
-    y = np.asarray(y, dtype=np.float64)
-
-    if len(y) < 5:
-        return y
-
-    s = pd.Series(y)
-
-    if method == "rolling":
-        return s.rolling(window=window, center=True, min_periods=1).mean().to_numpy()
-
-    if method == "ema":
-        return s.ewm(span=ema_span, adjust=False).mean().to_numpy()
-
-    return y  # fallback (no smoothing)
-
-
-def pick_best_row_for_can_id(cands_df: pd.DataFrame, target_can_id: int) -> Optional[pd.Series]:
-    """
-    Returns the highest-ranked candidate row (bytepair/endian) for a given CAN ID.
-    If CAN ID is not in candidates, returns None.
-    """
-    if cands_df is None or len(cands_df) == 0:
-        return None
-
-    sub = cands_df[cands_df["can_id_dec"].astype(int) == int(target_can_id)]
-    if sub.empty:
-        return None
-
-    # already ranked, so top row is best
-    return sub.iloc[0]
-
-
-def plot_candidate_with_trigger_overlay(
-    df,
-    cand_row,
-    trigger_bytes_df,
-    lka_id: int,
-    trigger_byte: int,
-    trigger_values: List[int],
-    zoom_mode="full",
-    pad_seconds=10,
-    on_value=0x04,
-    y_percentile_clip=(1, 99),
-    fig_size=(16, 7),
-    y_pad_frac=0.08,
-    smooth=False,
-    smooth_method="rolling",
-    smooth_window=25,
-    outpath: Optional[str] = None
-):
-    can_hex = cand_row["can_id_hex"]
-    can_id = int(cand_row["can_id_dec"])
-    byte_pair = cand_row["byte_pair"]
-    endian = cand_row["endian"]
-
-    # Candidate signal (u16 raw)
-    s = u16_series_for_candidate(df, can_id, byte_pair, endian)
-    if s is None:
-        print(f"Skipping {can_hex} {byte_pair} {endian}: not enough data.")
-        return
         
-    t = s["Timestamp"].values
-    u16_vals = s["u16"].values
-
-    # Compute both interpretations
-    i16_vals = u16_to_i16(u16_vals)
-
-    # Trigger series
-    tb = trigger_bytes_df.sort_values("Timestamp").copy()
-    tt = tb["Timestamp"].values
-    trig = tb["trigger_byte_state"].values
-    trig_label = f"{hex(lka_id)} Byte{trigger_byte}"
-    
-    on_mask = np.isin(tb["trigger_byte_state"].values, trigger_values)
-
-    # Decide plot window
-    if zoom_mode == "auto":
-        on_times = tt[on_mask]
-        if len(on_times) > 0:
-            tmin = float(np.min(on_times) - pad_seconds)
-            tmax = float(np.max(on_times) + pad_seconds)
-        else:
-            tmin = float(np.nanmin(t))
-            tmax = float(np.nanmax(t))
-    else:
-        tmin = float(np.nanmin(t))
-        tmax = float(np.nanmax(t))
-
-        x_pad = 0.02 * (tmax - tmin)
-        tmin -= x_pad
-        tmax += x_pad
-
-    # Zoom masks
-    z1 = (t >= tmin) & (t <= tmax)
-    z2 = (tt >= tmin) & (tt <= tmax)
-
-    t_zoom = t[z1]
-    u16_zoom = u16_vals[z1]
-    i16_zoom = i16_vals[z1]
-
-    # Optional smoothing
-    if smooth:
-        u16_zoom = smooth_array(u16_zoom, method=smooth_method, window=smooth_window, ema_span=smooth_window)
-        i16_zoom = smooth_array(i16_zoom, method=smooth_method, window=smooth_window, ema_span=smooth_window)
-
-    if len(t_zoom) < 5:
-        print(f"Skipping {can_hex} {byte_pair} {endian}: not enough points in window.")
-        return
-
-    # Y-limits based on both series combined
-    combined = np.concatenate([u16_zoom[np.isfinite(u16_zoom)], i16_zoom[np.isfinite(i16_zoom)]])
-    if len(combined) > 20:
-        lo, hi = np.nanpercentile(combined, y_percentile_clip)
-        y_min, y_max = float(lo), float(hi)
-    else:
-        y_min = float(np.nanmin(combined))
-        y_max = float(np.nanmax(combined))
-
-    # Add headroom padding
-    y_rng = max(1e-9, (y_max - y_min))
-    y_min = y_min - y_pad_frac * y_rng
-    y_max = y_max + y_pad_frac * y_rng
-
-    # ---- Plot ----
-    fig, ax1 = plt.subplots(figsize=fig_size)
-
-    ax1.plot(t_zoom, u16_zoom, color="red", linewidth=1.0, label="Candidate unsigned u16")
-    ax1.plot(t_zoom, i16_zoom, color="gold", linewidth=1.0, label="Candidate signed i16")
-
-    ax1.set_xlabel("Time (s)")
-    ax1.set_ylabel("Candidate value")
-    ax1.grid(True, linewidth=0.5)
-    ax1.set_xlim(tmin, tmax)
-    ax1.set_ylim(y_min, y_max)
-
-    # Trigger overlay (right axis) dark blue
-    ax2 = ax1.twinx()
-    ax2.step(tt[z2], trig[z2], where="post", color="darkblue", linewidth=1.2, label=trig_label)
-    ax2.set_ylabel(trig_label)
-
-    # Title
-    smooth_tag = f"SMOOTH({smooth_method}, N={smooth_window})" if smooth else "RAW"
-    ax1.set_title(f"{can_hex}  {byte_pair}  {endian}  (u16 + i16)  + Trigger Overlay   [{smooth_tag}]")
-
-    # Legends
-    ax1.legend(loc="upper left")
-    ax2.legend(loc="upper right")
-
-    fig.tight_layout()
-
-    if outpath:
-        fig.savefig(outpath, dpi=150)
-        plt.close(fig)
-    else:
-        plt.show()
-        
-
+# =========================
+# Output folder helpers
+# =========================
 def infer_test_folder_name(csv_path: str) -> str:
     """
     Tries to infer a folder name like 'Test_4' from the CSV filename.
@@ -488,16 +300,20 @@ Examples:
     # Trigger plot (whole test)
     trigger_plot_path = os.path.join(test_outdir, "trigger_states_whole_test.png")
     plot_trigger_states_whole_test(
-        trigger_df, on_events, trigger_plot_path,
-        lka_id=lka_id, trigger_byte=trigger_byte, trigger_values=trigger_values
+        trigger_df=trigger_df,
+        on_events=on_events,
+        lka_id=lka_id,
+        trigger_byte=trigger_byte,
+        trigger_values=trigger_values,
+        outpath=trigger_plot_path,
     )
     print(f"Saved trigger plot: {trigger_plot_path}")
 
-    # Candidate scoring - NOTE: exclude_id=None to INCLUDE the trigger CAN ID in search
+    # Candidate scoring - exclude_id=None to INCLUDE the trigger CAN ID in search
     cands = build_candidates_multi_event_relaxed(
         df=df,
         on_events=on_events,
-        exclude_id=None,  # Include trigger CAN ID in search
+        exclude_id=None,  
         pre_window=args.pre,
         post_window=args.post,
         top_n=args.topn,
@@ -516,41 +332,60 @@ Examples:
     cands_unique = dedupe_by_can_id(cands, score_col="final_score")
     print(f"Unique CAN IDs in top list: {len(cands_unique)}")
 
-    # Plot each candidate across whole test
+ # Plot each candidate across whole test
     for i in range(len(cands_unique)):
         row = cands_unique.iloc[i]
-        can_hex = row["can_id_hex"].replace("0x", "")
-        byte_pair = row["byte_pair"].replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
+        can_hex = row["can_id_hex"]
+        can_hex_clean = can_hex.replace("0x", "")
+        can_id = int(row["can_id_dec"])
+        byte_pair = row["byte_pair"]
+        byte_pair_clean = byte_pair.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
         endian = row["endian"]
 
-        outpath = os.path.join(test_outdir, f"cand_{i:02d}_{can_hex}_{byte_pair}_{endian}.png")
+        # Get candidate data
+        s = u16_series_for_candidate(df, can_id, byte_pair, endian)
+        if s is None:
+            print(f"Skipping {can_hex} {byte_pair} {endian}: not enough data.")
+            continue
+
+        t = s["Timestamp"].values
+        u16_vals = s["u16"].values
+        i16_vals = u16_to_i16(u16_vals)
+
+        title = f"{can_hex}  {byte_pair}  {endian}  (u16 + i16)  + Trigger Overlay"
+
+        # Raw plot
+        outpath = os.path.join(test_outdir, f"cand_{i:02d}_{can_hex_clean}_{byte_pair_clean}_{endian}.png")
         plot_candidate_with_trigger_overlay(
-            df=df,
-            cand_row=row,
-            trigger_bytes_df=trigger_df,
+            t=t,
+            u16_vals=u16_vals,
+            i16_vals=i16_vals,
+            trigger_df=trigger_df,
             lka_id=lka_id,
             trigger_byte=trigger_byte,
             trigger_values=trigger_values,
+            title=title,
             zoom_mode="full",
             outpath=outpath,
-            smooth=False
+            smooth=False,
         )
 
-        # Save smoothed version too
-        outpath_smooth = os.path.join(test_outdir, f"cand_{i:02d}_{can_hex}_{byte_pair}_{endian}_smoothed.png")
-
+        # Smoothed plot
+        outpath_smooth = os.path.join(test_outdir, f"cand_{i:02d}_{can_hex_clean}_{byte_pair_clean}_{endian}_smoothed.png")
         plot_candidate_with_trigger_overlay(
-            df=df,
-            cand_row=row,
-            trigger_bytes_df=trigger_df,
+            t=t,
+            u16_vals=u16_vals,
+            i16_vals=i16_vals,
+            trigger_df=trigger_df,
             lka_id=lka_id,
             trigger_byte=trigger_byte,
             trigger_values=trigger_values,
+            title=title,
             zoom_mode="full",
             outpath=outpath_smooth,
             smooth=True,
             smooth_method="rolling",
-            smooth_window=25
+            smooth_window=25,
         )
 
     print(f"Saved {len(cands_unique)} candidate plots to: {test_outdir}")

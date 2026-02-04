@@ -3,15 +3,10 @@
 Plotting utilities for CAN decoding + trigger overlay.
 
 Supports:
+- Parameterized trigger support (any CAN ID, any byte, multiple trigger values)
 - Classic candidate plot: u16 (red) + i16 (gold) + trigger overlay (dark blue)
-- Multi-byte explore plot:
-    - i16 (from u16)
-    - i24 (from u24)
-    - bitfield decode from u16
-
-Also supports:
-- optional smoothing (rolling mean or EMA)
-- full test plotting with slight x-padding
+- Trigger state plot with ON event markers
+- Optional smoothing (rolling mean or EMA)
 """
 
 from __future__ import annotations
@@ -22,15 +17,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from multi_byte_decoder import build_u16_series, build_i16_series, build_u24_series, build_i24_series, build_bitfield_series_from_u16, u16_to_i16
-
-
 # -------------------------
 # Colors / style
 # -------------------------
 COLOR_U16 = "red"
 COLOR_I16 = "gold"
-COLOR_SIGNAL = "gold"     # used for i24 / bitfield (single-line)
 COLOR_TRIGGER = "darkblue"
 
 
@@ -62,6 +53,11 @@ def smooth_array(
         return s.ewm(span=ema_span, adjust=False).mean().to_numpy()
 
     return y
+
+def u16_to_i16(u16_vals: np.ndarray) -> np.ndarray:
+    """Convert unsigned 16-bit values to signed 16-bit."""
+    u = np.asarray(u16_vals, dtype=np.float64)
+    return np.where(u >= 32768, u - 65536, u)
 
 
 def compute_y_limits_from_data(
@@ -108,48 +104,73 @@ def compute_x_limits_full_test(t: np.ndarray, pad_frac: float = 0.02) -> Tuple[f
     x_pad = pad_frac * (tmax - tmin)
     return tmin - x_pad, tmax + x_pad
 
-
-def trigger_series_from_df(
-    trigger_bytes_df: pd.DataFrame,
-    prefer_trigger: str = "Byte7",
-    on_value: int = 0x04
-) -> Tuple[np.ndarray, np.ndarray, str]:
+# ======================================================================
+# Trigger state plot (whole test)
+# ======================================================================
+def plot_trigger_states_whole_test(
+    trigger_df: pd.DataFrame,
+    on_events: List[float],
+    lka_id: int,
+    trigger_byte: int,
+    trigger_values: List[int],
+    outpath: Optional[str] = None,
+    fig_size: Tuple[int, int] = (16, 3),
+):
     """
-    Returns (tt, trig_vals, trig_label)
-    where trig_vals is Byte7_state or Byte2_state or ON mask.
+    Plot trigger byte state over time with ON event markers.
+    
+    Args:
+        trigger_df: DataFrame with 'Timestamp' and 'trigger_byte_state' columns
+        on_events: List of timestamps where trigger ON events occurred
+        lka_id: CAN ID used for trigger
+        trigger_byte: Which byte (1-8) contains the trigger
+        trigger_values: List of values that indicate trigger ON
+        outpath: Path to save figure (if None, displays instead)
+        fig_size: Figure size tuple
     """
-    tb = trigger_bytes_df.sort_values("Timestamp").copy()
-    tt = tb["Timestamp"].to_numpy(dtype=np.float64)
+    t = trigger_df["Timestamp"].values
+    trigger_state = trigger_df["trigger_byte_state"].values
 
-    if prefer_trigger == "Byte7":
-        trig = tb["Byte7_state"].to_numpy(dtype=np.float64)
-        trig_label = "0x275 Byte7"
-    elif prefer_trigger == "Byte2":
-        trig = tb["Byte2_state"].to_numpy(dtype=np.float64)
-        trig_label = "0x275 Byte2"
+    fig, ax = plt.subplots(figsize=fig_size)
+
+    ax.step(t, trigger_state, where="post", linewidth=1.2, label=f"{hex(lka_id)} Byte{trigger_byte}")
+
+    for et in on_events:
+        ax.axvline(et, color="red", linestyle="--", linewidth=1.5)
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Trigger State (byte value)")
+    
+    values_str = ", ".join(hex(v) for v in trigger_values)
+    ax.set_title(f"LKA Trigger States from {hex(lka_id)} Byte{trigger_byte}, ON events (-> {values_str}) marked red")
+    
+    ax.grid(True, linewidth=0.5)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+
+    if outpath:
+        fig.savefig(outpath, dpi=150)
+        plt.close(fig)
     else:
-        trig = (
-            (tb["Byte7_state"].to_numpy(dtype=np.float64) == float(on_value))
-            | (tb["Byte2_state"].to_numpy(dtype=np.float64) == float(on_value))
-        ).astype(int)
-        trig_label = "0x275 ON mask"
+        plt.show()
 
-    return tt, trig, trig_label
-
-
+        
 # ======================================================================
-# 1) Classic candidate plot (u16 red + i16 gold) + trigger overlay
+# Candidate plot with trigger overlay (u16 red + i16 gold)
 # ======================================================================
-def plot_candidate_u16_i16_with_trigger_overlay(
+def plot_candidate_with_trigger_overlay(
     t: np.ndarray,
     u16_vals: np.ndarray,
     i16_vals: np.ndarray,
-    trigger_bytes_df: pd.DataFrame,
+    trigger_df: pd.DataFrame,
+    lka_id: int,
+    trigger_byte: int,
+    trigger_values: List[int],
     title: str,
-    prefer_trigger: str = "Byte7",
-    on_value: int = 0x04,
-    fig_size: Tuple[int, int] = (16, 7),
+    zoom_mode: str = "full",
+    pad_seconds: float = 10.0,
     y_percentile_clip: Tuple[float, float] = (1, 99),
+    fig_size: Tuple[int, int] = (16, 7),
     y_pad_frac: float = 0.08,
     smooth: bool = False,
     smooth_method: str = "rolling",
@@ -157,33 +178,81 @@ def plot_candidate_u16_i16_with_trigger_overlay(
     outpath: Optional[str] = None,
 ):
     """
-    Plot u16 (red) + i16 (gold) and trigger overlay (dark blue).
-    This assumes you already decoded the signal (arrays passed in).
+    Plot u16 (red) + i16 (gold) candidate signal with trigger overlay (dark blue).
+    
+    Args:
+        t: Timestamps for candidate signal
+        u16_vals: Unsigned 16-bit decoded values
+        i16_vals: Signed 16-bit decoded values
+        trigger_df: DataFrame with 'Timestamp' and 'trigger_byte_state' columns
+        lka_id: CAN ID used for trigger
+        trigger_byte: Which byte (1-8) contains the trigger
+        trigger_values: List of values that indicate trigger ON
+        title: Plot title
+        zoom_mode: "full" for entire test, "auto" to zoom around trigger events
+        pad_seconds: Padding around trigger events when zoom_mode="auto"
+        y_percentile_clip: Percentile range for y-axis limits
+        fig_size: Figure size tuple
+        y_pad_frac: Fractional padding for y-axis headroom
+        smooth: Whether to apply smoothing
+        smooth_method: "rolling" or "ema"
+        smooth_window: Window size for smoothing
+        outpath: Path to save figure (if None, displays instead)
     """
-
     t = np.asarray(t, dtype=np.float64)
     u16_vals = np.asarray(u16_vals, dtype=np.float64)
     i16_vals = np.asarray(i16_vals, dtype=np.float64)
 
-    # smoothing
-    if smooth:
-        u16_vals = smooth_array(u16_vals, method=smooth_method, window=smooth_window, ema_span=smooth_window)
-        i16_vals = smooth_array(i16_vals, method=smooth_method, window=smooth_window, ema_span=smooth_window)
+    # Trigger series
+    tb = trigger_df.sort_values("Timestamp").copy()
+    tt = tb["Timestamp"].values
+    trig = tb["trigger_byte_state"].values
+    trig_label = f"{hex(lka_id)} Byte{trigger_byte}"
 
-    # full x range + small padding
-    tmin, tmax = compute_x_limits_full_test(t, pad_frac=0.02)
+    # ON mask for multiple trigger values
+    on_mask = np.isin(tb["trigger_byte_state"].values, trigger_values)
 
-    # y limits from both
-    y_min, y_max = compute_y_limits_from_data([u16_vals, i16_vals], y_percentile_clip, y_pad_frac)
+    # Decide plot window
+    if zoom_mode == "auto":
+        on_times = tt[on_mask]
+        if len(on_times) > 0:
+            tmin = float(np.min(on_times) - pad_seconds)
+            tmax = float(np.max(on_times) + pad_seconds)
+        else:
+            tmin = float(np.nanmin(t))
+            tmax = float(np.nanmax(t))
+    else:
+        tmin = float(np.nanmin(t))
+        tmax = float(np.nanmax(t))
+        x_pad = 0.02 * (tmax - tmin)
+        tmin -= x_pad
+        tmax += x_pad
 
-    # trigger series
-    tt, trig, trig_label = trigger_series_from_df(trigger_bytes_df, prefer_trigger, on_value)
+    # Zoom masks
+    z1 = (t >= tmin) & (t <= tmax)
     z2 = (tt >= tmin) & (tt <= tmax)
 
+    t_zoom = t[z1]
+    u16_zoom = u16_vals[z1]
+    i16_zoom = i16_vals[z1]
+
+    # Optional smoothing
+    if smooth:
+        u16_zoom = smooth_array(u16_zoom, method=smooth_method, window=smooth_window, ema_span=smooth_window)
+        i16_zoom = smooth_array(i16_zoom, method=smooth_method, window=smooth_window, ema_span=smooth_window)
+
+    if len(t_zoom) < 5:
+        print(f"Skipping plot: not enough points in window.")
+        return
+
+    # Y-limits based on both series combined
+    y_min, y_max = compute_y_limits_from_data([u16_zoom, i16_zoom], y_percentile_clip, y_pad_frac)
+
+    # ---- Plot ----
     fig, ax1 = plt.subplots(figsize=fig_size)
 
-    ax1.plot(t, u16_vals, color=COLOR_U16, linewidth=1.0, label="Unsigned u16")
-    ax1.plot(t, i16_vals, color=COLOR_I16, linewidth=1.0, label="Signed i16")
+    ax1.plot(t_zoom, u16_zoom, color=COLOR_U16, linewidth=1.0, label="Candidate unsigned u16")
+    ax1.plot(t_zoom, i16_zoom, color=COLOR_I16, linewidth=1.0, label="Candidate signed i16")
 
     ax1.set_xlabel("Time (s)")
     ax1.set_ylabel("Candidate value")
@@ -191,13 +260,16 @@ def plot_candidate_u16_i16_with_trigger_overlay(
     ax1.set_xlim(tmin, tmax)
     ax1.set_ylim(y_min, y_max)
 
+    # Trigger overlay (right axis) dark blue
     ax2 = ax1.twinx()
     ax2.step(tt[z2], trig[z2], where="post", color=COLOR_TRIGGER, linewidth=1.2, label=trig_label)
     ax2.set_ylabel(trig_label)
 
+    # Title with smooth tag
     smooth_tag = f"SMOOTH({smooth_method}, N={smooth_window})" if smooth else "RAW"
     ax1.set_title(f"{title}   [{smooth_tag}]")
 
+    # Legends
     ax1.legend(loc="upper left")
     ax2.legend(loc="upper right")
 
@@ -208,195 +280,3 @@ def plot_candidate_u16_i16_with_trigger_overlay(
         plt.close(fig)
     else:
         plt.show()
-
-
-# ======================================================================
-# 2) Multi-byte explore plot (i16 OR i24 OR bitfield) + trigger overlay
-# ======================================================================
-def plot_single_signal_with_trigger_overlay(
-    t: np.ndarray,
-    y: np.ndarray,
-    trigger_bytes_df: pd.DataFrame,
-    title: str,
-    prefer_trigger: str = "Byte7",
-    on_value: int = 0x04,
-    fig_size: Tuple[int, int] = (16, 7),
-    y_percentile_clip: Tuple[float, float] = (1, 99),
-    y_pad_frac: float = 0.08,
-    smooth: bool = False,
-    smooth_method: str = "rolling",
-    smooth_window: int = 25,
-    outpath: Optional[str] = None,
-):
-    """
-    Plot ONE signal (gold) + trigger overlay.
-    Used for i24 decode and bitfield decode.
-    """
-    t = np.asarray(t, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-
-    if smooth:
-        y = smooth_array(y, method=smooth_method, window=smooth_window, ema_span=smooth_window)
-
-    tmin, tmax = compute_x_limits_full_test(t, pad_frac=0.02)
-    y_min, y_max = compute_y_limits_from_data([y], y_percentile_clip, y_pad_frac)
-
-    tt, trig, trig_label = trigger_series_from_df(trigger_bytes_df, prefer_trigger, on_value)
-    z2 = (tt >= tmin) & (tt <= tmax)
-
-    fig, ax1 = plt.subplots(figsize=fig_size)
-
-    ax1.plot(t, y, color=COLOR_SIGNAL, linewidth=1.0, label="Decoded signal")
-
-    ax1.set_xlabel("Time (s)")
-    ax1.set_ylabel("Signal value")
-    ax1.grid(True, linewidth=0.5)
-    ax1.set_xlim(tmin, tmax)
-    ax1.set_ylim(y_min, y_max)
-
-    ax2 = ax1.twinx()
-    ax2.step(tt[z2], trig[z2], where="post", color=COLOR_TRIGGER, linewidth=1.2, label=trig_label)
-    ax2.set_ylabel(trig_label)
-
-    smooth_tag = f"SMOOTH({smooth_method}, N={smooth_window})" if smooth else "RAW"
-    ax1.set_title(f"{title}   [{smooth_tag}]")
-
-    ax1.legend(loc="upper left")
-    ax2.legend(loc="upper right")
-
-    fig.tight_layout()
-
-    if outpath:
-        fig.savefig(outpath, dpi=150)
-        plt.close(fig)
-    else:
-        plt.show()
-
-
-# ======================================================================
-# 3) Convenience wrapper to plot from an explore row (from multi_byte_explore)
-# ======================================================================
-def plot_from_explore_row(
-    df: pd.DataFrame,
-    explore_row: pd.Series,
-    trigger_bytes_df: pd.DataFrame,
-    prefer_trigger: str = "Byte7",
-    on_value: int = 0x04,
-    fig_size: Tuple[int, int] = (16, 7),
-    smooth: bool = False,
-    smooth_method: str = "rolling",
-    smooth_window: int = 25,
-    outpath: Optional[str] = None,
-):
-    """
-    This plots a row from multi_byte_explore.explore_decode_space_for_id() output.
-    It decodes the series again based on row config.
-
-    Expected explore_row fields:
-      - can_id_dec
-      - kind: "u16/i16", "u24/i24", "bitfield"
-      - start_byte
-      - endian
-      - for bitfield: bit_len, bit_shift, signed
-    """
-    can_id = int(explore_row["can_id_dec"])
-    kind = str(explore_row["kind"])
-    start_byte = int(explore_row["start_byte"])
-    endian = str(explore_row["endian"])
-
-    can_hex = hex(can_id)
-
-    # ---- u16/i16 ----
-    if kind == "u16/i16":
-        s_u16 = build_u16_series(df, can_id, start_byte, endian)
-        if s_u16 is None:
-            print(f"[WARN] Could not decode {can_hex} u16 at Byte{start_byte} {endian}")
-            return
-
-        t = s_u16["Timestamp"].to_numpy(dtype=np.float64)
-        u16_vals = s_u16["u16"].to_numpy(dtype=np.float64)
-        i16_vals = u16_to_i16(u16_vals)
-
-        title = f"{can_hex}  u16/i16  start=Byte{start_byte}  {endian}"
-        plot_candidate_u16_i16_with_trigger_overlay(
-            t=t,
-            u16_vals=u16_vals,
-            i16_vals=i16_vals,
-            trigger_bytes_df=trigger_bytes_df,
-            title=title,
-            prefer_trigger=prefer_trigger,
-            on_value=on_value,
-            fig_size=fig_size,
-            smooth=smooth,
-            smooth_method=smooth_method,
-            smooth_window=smooth_window,
-            outpath=outpath,
-        )
-        return
-
-    # ---- u24/i24 ----
-    if kind == "u24/i24":
-        s_i24 = build_i24_series(df, can_id, start_byte, endian)
-        if s_i24 is None:
-            print(f"[WARN] Could not decode {can_hex} i24 at Byte{start_byte} {endian}")
-            return
-
-        t = s_i24["Timestamp"].to_numpy(dtype=np.float64)
-        y = s_i24["i24"].to_numpy(dtype=np.float64)
-
-        title = f"{can_hex}  i24  start=Byte{start_byte}  {endian}"
-        plot_single_signal_with_trigger_overlay(
-            t=t,
-            y=y,
-            trigger_bytes_df=trigger_bytes_df,
-            title=title,
-            prefer_trigger=prefer_trigger,
-            on_value=on_value,
-            fig_size=fig_size,
-            smooth=smooth,
-            smooth_method=smooth_method,
-            smooth_window=smooth_window,
-            outpath=outpath,
-        )
-        return
-
-    # ---- bitfield ----
-    if kind == "bitfield":
-        bit_len = int(explore_row["bit_len"])
-        bit_shift = int(explore_row["bit_shift"])
-        signed = bool(explore_row.get("signed", True))
-
-        s_bf = build_bitfield_series_from_u16(
-            df=df,
-            can_id=can_id,
-            start_byte=start_byte,
-            endian=endian,
-            bit_shift=bit_shift,
-            bit_len=bit_len,
-            signed=signed,
-        )
-        if s_bf is None:
-            print(f"[WARN] Could not decode {can_hex} bitfield at Byte{start_byte} {endian} shift={bit_shift} len={bit_len}")
-            return
-
-        t = s_bf["Timestamp"].to_numpy(dtype=np.float64)
-        y = s_bf["val"].to_numpy(dtype=np.float64)
-
-        sign_tag = "signed" if signed else "unsigned"
-        title = f"{can_hex}  bitfield({sign_tag})  start=Byte{start_byte} {endian}  shift={bit_shift} len={bit_len}"
-        plot_single_signal_with_trigger_overlay(
-            t=t,
-            y=y,
-            trigger_bytes_df=trigger_bytes_df,
-            title=title,
-            prefer_trigger=prefer_trigger,
-            on_value=on_value,
-            fig_size=fig_size,
-            smooth=smooth,
-            smooth_method=smooth_method,
-            smooth_window=smooth_window,
-            outpath=outpath,
-        )
-        return
-
-    print(f"[WARN] Unknown kind='{kind}' for {can_hex}")
