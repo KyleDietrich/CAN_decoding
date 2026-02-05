@@ -14,7 +14,7 @@ from plotting_utils import (
     plot_candidate_with_trigger_overlay,
     u16_to_i16,
 )
-from multi_byte_decoder import explore_decode_space_for_targets
+from multi_byte_decoder import explore_decode_space_for_targets, decode_series_from_row, describe_decode
 
 # =========================
 # Config
@@ -332,7 +332,65 @@ Examples:
     cands_unique = dedupe_by_can_id(cands, score_col="final_score")
     print(f"Unique CAN IDs in top list: {len(cands_unique)}")
 
- # Plot each candidate across whole test
+
+    # # =========================
+    # # Deep decode exploration (multi-byte)
+    # # =========================
+    # target_ids = df["CAN_ID"].unique().tolist()
+    # target_ids = [int(x) for x in target_ids if not np.isnan(x)]
+
+    # print(f"\nRunning deep decode exploration for ALL {len(target_ids)} CAN IDs found in CSV")
+
+    # deep_df = explore_decode_space_for_targets(
+    #     df=df,
+    #     on_events=on_events,
+    #     target_ids=target_ids,
+    #     pre_window=args.pre,
+    #     post_window=args.post,
+    # )
+
+    # if deep_df.empty:
+    #     print("No deep decode candidates found.")
+    #     return
+
+    # deep_csv = os.path.join(test_outdir, "deep_decode_candidates.csv")
+    # deep_df.to_csv(deep_csv, index=False)
+    # print(f"Saved deep decode table: {deep_csv}")
+
+    # # Plot top deep decode candidates
+    # MAX_DEEP_PLOTS = 100
+
+    # for i in range(min(MAX_DEEP_PLOTS, len(deep_df))):
+    #     row = deep_df.iloc[i]
+
+    #     s = decode_series_from_row(df, row)
+    #     if s is None or len(s) < 30:
+    #         continue
+
+    #     label = describe_decode(row)
+    #     can_hex = row["can_id_hex"].replace("0x", "")
+
+    #     outpath = os.path.join(
+    #         test_outdir,
+    #         f"deep_{i:02d}_{can_hex}_{label.replace(' ', '_')}.png",
+    #     )
+
+    #     plot_candidate_with_trigger_overlay(
+    #         t=s["Timestamp"].values,
+    #         u16_vals=s["unsigned"].values, 
+    #         i16_vals=s["signed"].values,     
+    #         trigger_df=trigger_df,
+    #         lka_id=lka_id,
+    #         trigger_byte=trigger_byte,
+    #         trigger_values=trigger_values,
+    #         title=f"{row['can_id_hex']} {label}",
+    #         zoom_mode="full",
+    #         outpath=outpath,
+    #         smooth=False,
+    #     )
+
+
+    # Plot each candidate across whole test
     for i in range(len(cands_unique)):
         row = cands_unique.iloc[i]
         can_hex = row["can_id_hex"]

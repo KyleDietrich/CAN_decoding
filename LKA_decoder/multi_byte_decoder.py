@@ -410,6 +410,96 @@ def generate_bitfield_decode_configs(
                     )
     return cfgs
 
+def decode_series_from_row(df: pd.DataFrame, row: pd.Series) -> Optional[pd.DataFrame]:
+    """
+    Re-decode a signal using one row from explore_decode_space_for_* output.
+    Returns DataFrame with columns: ["Timestamp", "unsigned", "signed"]
+    """
+    kind = row["kind"]
+    can_id = int(row["can_id_dec"])
+    start_byte = int(row["start_byte"])
+    endian = row["endian"]
+
+    if kind == "u16/i16":
+        # Get both u16 and i16
+        s_u16 = build_u16_series(df, can_id, start_byte, endian)
+        if s_u16 is None:
+            return None
+        s_i16 = s_u16.copy()
+        s_i16["signed"] = u16_to_i16(s_u16["u16"].values)
+        return pd.DataFrame({
+            "Timestamp": s_u16["Timestamp"].values,
+            "unsigned": s_u16["u16"].values,
+            "signed": s_i16["signed"].values
+        })
+
+    if kind == "u24/i24":
+        # Get both u24 and i24
+        s_u24 = build_u24_series(df, can_id, start_byte, endian)
+        if s_u24 is None:
+            return None
+        s_i24 = s_u24.copy()
+        s_i24["signed"] = u24_to_i24(s_u24["u24"].values)
+        return pd.DataFrame({
+            "Timestamp": s_u24["Timestamp"].values,
+            "unsigned": s_u24["u24"].values,
+            "signed": s_i24["signed"].values
+        })
+
+    if kind == "bitfield":
+        bit_shift = int(row["bit_shift"])
+        bit_len = int(row["bit_len"])
+        
+        # Get signed version
+        s_signed = build_bitfield_series_from_u16(
+            df=df,
+            can_id=can_id,
+            start_byte=start_byte,
+            endian=endian,
+            bit_shift=bit_shift,
+            bit_len=bit_len,
+            signed=True,
+        )
+        
+        # Get unsigned version
+        s_unsigned = build_bitfield_series_from_u16(
+            df=df,
+            can_id=can_id,
+            start_byte=start_byte,
+            endian=endian,
+            bit_shift=bit_shift,
+            bit_len=bit_len,
+            signed=False,
+        )
+        
+        if s_signed is None or s_unsigned is None:
+            return None
+            
+        return pd.DataFrame({
+            "Timestamp": s_signed["Timestamp"].values,
+            "unsigned": s_unsigned["val"].values,
+            "signed": s_signed["val"].values
+        })
+
+    return None
+
+def describe_decode(row: pd.Series) -> str:
+    if row["kind"] == "u16/i16":
+        return f"i16 Byte{row['start_byte']} {row['endian']}"
+
+    if row["kind"] == "u24/i24":
+        return f"i24 Byte{row['start_byte']} {row['endian']}"
+
+    if row["kind"] == "bitfield":
+        return (
+            f"bitfield Byte{row['start_byte']} "
+            f"shift={row['bit_shift']} len={row['bit_len']} "
+            f"{'signed' if row['signed'] else 'unsigned'} "
+            f"{row['endian']}"
+        )
+
+    return "unknown"
+
 
 # =========================
 # Exploration Runner
@@ -493,6 +583,32 @@ def explore_decode_space_for_id(
         )
         if score is None:
             continue
+        
+        # ============================================================
+        # NOISE FILTERS
+        # ============================================================
+        
+        # Filter 1: Pre-activity too high (noisy even before trigger)
+        # If signal is already super active before trigger, it's probably just noise/counter
+        if score["pre_activity_median"] > 10000: 
+            continue
+        
+        # Filter 2: Check change fraction from segment_metrics
+        # Calculate it manually from the series
+        value_col_name = [c for c in series_df.columns if c != "Timestamp"][0]
+        vals = series_df[value_col_name].values
+        if len(vals) > 10:
+            changes = np.diff(vals)
+            change_frac = float(np.mean(changes != 0))
+            
+            # If 95%+ of samples change, it's probably a counter or high-freq noise
+            if change_frac > 0.75:
+                continue
+        
+        # Filter 3: Gain must be somewhat meaningful
+        if score["gain"] < 2.0:  
+            continue
+        
 
         row = {
             "can_id_hex": hex(int(can_id)),

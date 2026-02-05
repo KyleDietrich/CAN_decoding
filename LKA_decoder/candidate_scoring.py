@@ -189,21 +189,21 @@ def build_candidates_multi_event_relaxed(
                 pre_med = float(np.median(pre_acts))
 
                 # relaxed: only require *some* post activity
-                if post_med < 100:
+                if post_med < 1:
                     continue
 
                 gain = (post_med + eps) / (pre_med + eps)
                 gain = float(min(gain, 50.0))
 
                 # relaxed gain threshold
-                if gain < 1.05:
+                if gain < 0.5:
                     continue
 
                 cons = consistency_factor(post_acts)
 
                 # relaxed big-jump reject (avoid obvious counters)
                 post_bigjump_med = float(np.median(post_bigjumps)) if len(post_bigjumps) else 0.0
-                if post_bigjump_med > 0.10:
+                if post_bigjump_med > 0.95:
                     continue
 
                 final = post_med * gain * cons
@@ -225,7 +225,7 @@ def build_candidates_multi_event_relaxed(
     if out.empty:
         return out
 
-    out = out.sort_values("final_score", ascending=False).head(top_n).reset_index(drop=True)
+    out = out.sort_values("final_score", ascending=False).reset_index(drop=True)
     return out
 
 
