@@ -15,6 +15,7 @@ from plotting_utils import (
     u16_to_i16,
 )
 from multi_byte_decoder import explore_decode_space_for_targets, decode_series_from_row, describe_decode
+from nearby_id_explorer import explore_nearby_ids
 
 # =========================
 # Config
@@ -447,6 +448,29 @@ Examples:
         )
 
     print(f"Saved {len(cands_unique)} candidate plots to: {test_outdir}")
+
+    print(f"Saved {len(cands_unique)} candidate plots to: {test_outdir}")
+
+    # =======================
+    # NEARBY ID EXPLORATION 
+    # =======================
+    print("\n" + "="*40)
+    print("NEARBY ID EXHAUSTIVE EXPLORATION")
+    print("="*40)
+    
+    nearby_outdir = os.path.join(test_outdir, "nearby_ids")
+    
+    explore_nearby_ids(
+        df=df,
+        target_id=lka_id,  # Use the LKA ID as center
+        range_offset=5,     # Explore ±5 IDs
+        trigger_df=trigger_df,
+        lka_id=lka_id,
+        trigger_byte=trigger_byte,
+        trigger_values=trigger_values,
+        outdir=nearby_outdir,
+        smooth=False,  # Set to False if you want raw plots
+    )
 
 
 if __name__ == "__main__":
