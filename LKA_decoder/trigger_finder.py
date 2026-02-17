@@ -4,11 +4,12 @@ trigger_finder.py
 
 Automatically find candidate LKA trigger CAN IDs and bytes from CAN bus data.
 
-Looks for signals that:
-- Have a dominant "idle" value most of the time
-- Transition to one or more distinct "active" values occasionally
-- Have a relatively small number of unique values (state-based, not continuous)
-- Show clear transition events (not noisy/continuous signals)
+This version is tolerant of multiple CSV layouts, including:
+- "Classic" layout: columns like Identifier, Timestamp, Byte1..Byte8
+- "Arb.ID / unlabeled time / 64 bytes" layout (like your Test_1.csv):
+    col0 = CAN ID (e.g., 0x160) with a different header name
+    col1 = Time (seconds) with no header (often shows up as Unnamed: 1)
+    remaining columns = Byte 1 .. Byte 64 (hex strings like 'EC', '0', etc.)
 
 Usage:
     python trigger_finder.py --csv data.csv
@@ -16,8 +17,11 @@ Usage:
 """
 
 import argparse
+import math
 import os
-from typing import List, Dict, Optional, Tuple
+import re
+import shutil
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 import numpy as np
@@ -25,80 +29,264 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-BYTE_COLS = [f"Byte{i}" for i in range(1, 9)]
-
-
 # =========================
 # Helpers
 # =========================
+def clear_directory(dir_path: str) -> None:
+    """
+    Delete everything inside dir_path (files + subfolders), but keep dir_path itself.
+    Safe for re-running so each run produces a clean results folder.
+    """
+    if not os.path.exists(dir_path):
+        return
+    if not os.path.isdir(dir_path):
+        raise ValueError(f"Outdir is not a directory: {dir_path}")
+
+    for name in os.listdir(dir_path):
+        p = os.path.join(dir_path, name)
+        try:
+            if os.path.isfile(p) or os.path.islink(p):
+                os.remove(p)
+            else:
+                shutil.rmtree(p)
+        except Exception as e:
+            print(f"Warning: could not delete {p}: {e}")
+
 def hex_to_int(x):
-    """Convert hex string to int, return NaN for invalid values."""
+    """Convert a hex-ish byte/ID cell to int; returns NaN for invalid values.
+
+    Notes:
+    - Your logs store bytes as hex strings (e.g., 'EC', '0', 'FF', sometimes '0x1A').
+    - Some CSV readers may coerce values to floats (e.g., 0 -> 0.0). We treat X.0 as int(X).
+    """
     if pd.isna(x):
         return np.nan
+
+    # If already numeric, accept integer-like floats.
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+
+    if isinstance(x, (float, np.floating)):
+        if np.isnan(x):
+            return np.nan
+        if float(x).is_integer():
+            return int(x)
+        return np.nan
+
     s = str(x).strip()
     if s == "" or s.lower() == "errorframe":
         return np.nan
+
+    # Handle strings like '0.0' if they slip through
+    if re.fullmatch(r"\d+\.0+", s):
+        return int(float(s))
+
+    # common "0x" prefix
     s = s.replace("0x", "").replace("0X", "")
+
+    # bytes are always hex-ish in your format; treat digit-only as hex too
     if not all(ch in "0123456789abcdefABCDEF" for ch in s):
         return np.nan
+
     try:
         return int(s, 16)
     except Exception:
         return np.nan
 
 
-def load_and_clean_csv(csv_path: str) -> pd.DataFrame:
+    s = str(x).strip()
+    if s == "" or s.lower() == "errorframe":
+        return np.nan
+
+    # common "0x" prefix
+    s = s.replace("0x", "").replace("0X", "")
+
+    # allow plain decimal '0' style
+    # If it's purely digits, treat as hex anyway (works for 0-9)
+    if not all(ch in "0123456789abcdefABCDEF" for ch in s):
+        return np.nan
+
+    try:
+        return int(s, 16)
+    except Exception:
+        return np.nan
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize column names so we can robustly detect id/time/byte columns.
+    - Strips whitespace
+    - Converts 'Byte 1' -> 'Byte1'
+    - Keeps 'Unnamed: x' columns as-is
+    """
+    rename = {}
+    for c in df.columns:
+        if not isinstance(c, str):
+            continue
+        c0 = c
+        c1 = c.strip()
+
+        # Some headers in your sample have tabs embedded (e.g. 'Arb.ID\\tTime\\tData')
+        # We keep it as one column name, but normalize whitespace a bit.
+        c1 = re.sub(r"\s+", " ", c1)
+
+        m = re.match(r"^(?i:byte)\s*(\d+)$", c1)
+        if m:
+            rename[c0] = f"Byte{int(m.group(1))}"
+            continue
+
+        m = re.match(r"^(?i:byte)\s+(\d+)$", c1)
+        if m:
+            rename[c0] = f"Byte{int(m.group(1))}"
+            continue
+
+        rename[c0] = c1
+
+    return df.rename(columns=rename)
+
+
+def _detect_id_time_cols(df: pd.DataFrame) -> Tuple[str, str]:
+    """
+    Detect CAN ID and Timestamp columns.
+    Returns: (id_col, time_col)
+    """
+    cols = list(df.columns)
+
+    # ID: prefer known names
+    if "Identifier" in df.columns:
+        id_col = "Identifier"
+    else:
+        # common variations
+        candidates = []
+        for c in cols:
+            if not isinstance(c, str):
+                continue
+            cl = c.lower()
+            if "arb" in cl and "id" in cl:
+                candidates.append(c)
+            elif cl in {"can_id", "canid", "id", "arb.id", "arb_id"}:
+                candidates.append(c)
+        id_col = candidates[0] if candidates else cols[0]
+
+    # TIME: prefer known names
+    if "Timestamp" in df.columns:
+        time_col = "Timestamp"
+    elif "Time" in df.columns:
+        time_col = "Time"
+    else:
+        # If there's an Unnamed column in position 1, it's often the unlabeled time
+        if len(cols) > 1 and isinstance(cols[1], str) and cols[1].lower().startswith("unnamed"):
+            time_col = cols[1]
+        elif len(cols) > 1:
+            time_col = cols[1]
+        else:
+            # degenerate case; fall back to first
+            time_col = cols[0]
+
+    return id_col, time_col
+
+
+def _detect_byte_cols(df: pd.DataFrame, expected_n_bytes: Optional[int] = None) -> List[str]:
+    """
+    Detect byte columns (Byte1..ByteN). Returns sorted list.
+    If expected_n_bytes is provided, ensures Byte1..Byte{N} exist (adds missing with NaN).
+    """
+    byte_cols = []
+    for c in df.columns:
+        if not isinstance(c, str):
+            continue
+        m = re.match(r"^Byte(\d+)$", c)
+        if m:
+            byte_cols.append(c)
+
+    # Sort by byte index
+    def _byte_idx(name: str) -> int:
+        m = re.match(r"^Byte(\d+)$", name)
+        return int(m.group(1)) if m else 10**9
+
+    byte_cols = sorted(byte_cols, key=_byte_idx)
+
+    if expected_n_bytes is not None:
+        # Create any missing Byte{i} columns so downstream loops are consistent
+        for i in range(1, expected_n_bytes + 1):
+            col = f"Byte{i}"
+            if col not in df.columns:
+                df[col] = np.nan
+        byte_cols = [f"Byte{i}" for i in range(1, expected_n_bytes + 1)]
+
+    return byte_cols
+
+
+def load_and_clean_csv(csv_path: str, expected_n_bytes: Optional[int] = None) -> pd.DataFrame:
     """Load and clean CAN CSV data."""
-    df = pd.read_csv(csv_path)
-    
+    df = pd.read_csv(csv_path, dtype=str, low_memory=False)
+
+    df = _normalize_columns(df)
+    id_col, time_col = _detect_id_time_cols(df)
+
+    # Detect bytes (and optionally force a fixed count)
+    byte_cols = _detect_byte_cols(df, expected_n_bytes=expected_n_bytes)
+
     print(f"Loaded: {csv_path}")
     print(f"Rows (raw): {len(df)}")
-    
+    print(f"Detected ID column: {id_col!r}")
+    print(f"Detected time column: {time_col!r}")
+    print(f"Detected bytes: {len(byte_cols)} columns")
+
     # Parse CAN ID
-    df["CAN_ID"] = df["Identifier"].apply(hex_to_int)
-    
+    df["CAN_ID"] = df[id_col].apply(hex_to_int)
+
     # Parse bytes
-    for c in BYTE_COLS:
-        if c in df.columns:
-            df[c] = df[c].apply(hex_to_int).astype(float)
-        else:
-            df[c] = np.nan
-    
+    for c in byte_cols:
+        df[c] = df[c].apply(hex_to_int).astype(float)
+
     # Parse timestamp
-    df["Timestamp"] = pd.to_numeric(df["Timestamp"], errors="coerce")
-    
+    df["Timestamp"] = pd.to_numeric(df[time_col], errors="coerce")
+
     # Clean
-    df = df.dropna(subset=["Timestamp", "CAN_ID"]).sort_values("Timestamp").reset_index(drop=True)
-    
+    df = (
+        df.dropna(subset=["Timestamp", "CAN_ID"])
+          .sort_values("Timestamp")
+          .reset_index(drop=True)
+    )
+
+    # Attach detected bytes for downstream functions
+    df.attrs["byte_cols"] = byte_cols
+
     print(f"Rows after cleaning: {len(df)}")
     print(f"Unique CAN IDs: {df['CAN_ID'].nunique()}")
-    print(f"Time range: {df['Timestamp'].min():.2f}s - {df['Timestamp'].max():.2f}s")
+    print(f"Time range: {df['Timestamp'].min():.4f}s - {df['Timestamp'].max():.4f}s")
     print()
-    
+
     return df
 
 
 @dataclass
 class TriggerCandidate:
-    """Stores analysis results for a potential trigger signal."""
     can_id: int
-    byte_num: int  # 1-8
+    byte_num: int
     unique_values: List[int]
     dominant_value: int
     dominant_pct: float
     active_values: List[int]
-    transition_count: int
+    state_change_count: int
+    event_count: int
+    median_event_gap: float
     score: float
-    
+
     def __str__(self):
         active_hex = [hex(v) for v in self.active_values]
+        gap_str = "n/a" if math.isnan(self.median_event_gap) else f"{self.median_event_gap:.2f}s"
         return (
             f"CAN {hex(self.can_id)} Byte{self.byte_num}: "
             f"idle={hex(self.dominant_value)} ({self.dominant_pct:.1f}%), "
             f"active={active_hex}, "
-            f"transitions={self.transition_count}, "
+            f"changes={self.state_change_count}, "
+            f"events={self.event_count}, "
+            f"gap~{gap_str}, "
             f"score={self.score:.1f}"
         )
+
 
 
 def analyze_byte_for_triggers(
@@ -107,146 +295,196 @@ def analyze_byte_for_triggers(
     can_id: int,
     byte_num: int,
     min_events: int = 2,
+    max_events: Optional[int] = None,
+    min_unique: int = 2,
     max_unique: int = 15,
     min_dominant_pct: float = 50.0,
+    test_start: Optional[float] = None,
+    test_end: Optional[float] = None,
+    edge_seconds: float = 5.0,
+    intertrigger_gap: Optional[float] = None,
+    intertrigger_tol: float = 0.5,
 ) -> Optional[TriggerCandidate]:
     """
     Analyze a single byte stream to see if it looks like a trigger signal.
-    
-    Args:
-        timestamps: Array of timestamps
-        values: Array of byte values
-        can_id: CAN ID for reporting
-        byte_num: Byte number (1-8) for reporting
-        min_events: Minimum number of transition events required
-        max_unique: Maximum unique values (filters out continuous signals)
-        min_dominant_pct: Minimum percentage for dominant/idle value
-    
-    Returns:
-        TriggerCandidate if this looks like a trigger, None otherwise
     """
     # Remove NaN values
     mask = ~np.isnan(values)
     values = values[mask].astype(int)
     timestamps = timestamps[mask]
-    
+
     if len(values) < 100:
         return None
-    
-    # Get unique values and their counts
+
     unique_vals, counts = np.unique(values, return_counts=True)
-    
-    # Filter: too many unique values = probably continuous signal
+
+    # If you know the trigger has a small number of discrete states,
+    # you can require a minimum number of unique values.
+    if len(unique_vals) < min_unique:
+        return None
+
     if len(unique_vals) > max_unique:
         return None
-    
-    # Filter: only 1 unique value = no transitions at all
+
     if len(unique_vals) < 2:
         return None
-    
-    # Find dominant (idle) value
+
     dominant_idx = np.argmax(counts)
     dominant_value = unique_vals[dominant_idx]
-    dominant_count = counts[dominant_idx]
-    dominant_pct = 100.0 * dominant_count / len(values)
-    
-    # Filter: must have a clear dominant value
+    dominant_pct = 100.0 * float(counts[dominant_idx]) / len(values)
+
     if dominant_pct < min_dominant_pct:
         return None
-    
-    # Active values = everything except dominant
+
     active_values = [int(v) for v in unique_vals if v != dominant_value]
-    
-    # Count transitions INTO active values (from non-active)
-    prev_values = np.roll(values, 1)
-    prev_values[0] = values[0]
-    
-    # Transition = current is active AND previous was not active (or was different active)
-    is_active = np.isin(values, active_values)
-    was_not_active = ~np.isin(prev_values, active_values)
-    transitions = np.sum(is_active & was_not_active)
-    
-    # Filter: need minimum number of transition events
-    if transitions < min_events:
+
+    # -------------------------
+    # 1) Count ALL state changes
+    # -------------------------
+    prev_for_changes = np.roll(values, 1)
+    prev_for_changes[0] = values[0]  # don't count an artificial "first sample" change
+    change_mask = (values != prev_for_changes)
+    change_mask[0] = False
+    state_changes = int(np.sum(change_mask))
+
+    if state_changes < min_events:
         return None
-    
-    # Score the candidate
-    # Higher score = better trigger candidate
-    # - More transitions (up to a point) is good
-    # - Higher dominant percentage is good
-    # - Fewer unique values is good (cleaner state machine)
+
+    if max_events is not None and state_changes > max_events:
+        return None
+
+    # -----------------------------------------
+    # 2) Event starts: idle -> non-idle
+    # -----------------------------------------
+    prev_for_events = np.roll(values, 1)
+    prev_for_events[0] = dominant_value  # treat first sample as if it came from idle
+    event_start_mask = (prev_for_events == dominant_value) & (values != dominant_value)
+    event_start_times = timestamps[event_start_mask]
+    event_count = int(len(event_start_times))
+
+    # If there's never an idle->non-idle transition, it's probably not a trigger-style signal.
+    if event_count == 0:
+        return None
+
+    # Median gap between events (for info/debug)
+    if event_count >= 2:
+        median_gap = float(np.median(np.diff(event_start_times)))
+    else:
+        median_gap = float("nan")
+
+    # -----------------------------------------
+    # 3) Exclude candidates where ALL events
+    #    occur within the first OR last N seconds
+    # -----------------------------------------
+    if edge_seconds and edge_seconds > 0 and test_start is not None and test_end is not None:
+        duration = float(test_end) - float(test_start)
+        if duration > 2.0 * edge_seconds:
+            if np.all(event_start_times <= float(test_start) + edge_seconds):
+                return None
+            if np.all(event_start_times >= float(test_end) - edge_seconds):
+                return None
+
+    # -----------------------------------------
+    # 4) Optional: require a consistent inter-trigger gap
+    # -----------------------------------------
+    if intertrigger_gap is not None:
+        if event_count < 2:
+            return None
+        gaps = np.diff(event_start_times)
+        
+        # MINIMUM allowed gap (seconds).
+        min_allowed = float(intertrigger_gap)  # strict
+        if np.any(gaps < min_allowed):
+            return None
+
+    # Score: favor (reasonable) number of state changes + strong idle dominance + fewer unique states
     score = (
-        min(transitions, 20) * 10  # Cap transition contribution
-        + dominant_pct * 0.5       # Reward clear idle state
-        - len(unique_vals) * 2     # Penalty for too many states
+        min(state_changes, 40) * 5
+        + dominant_pct * 0.5
+        - len(unique_vals) * 2
     )
-    
+
     return TriggerCandidate(
-        can_id=can_id,
-        byte_num=byte_num,
+        can_id=int(can_id),
+        byte_num=int(byte_num),
         unique_values=[int(v) for v in unique_vals],
         dominant_value=int(dominant_value),
-        dominant_pct=dominant_pct,
+        dominant_pct=float(dominant_pct),
         active_values=active_values,
-        transition_count=int(transitions),
-        score=score,
+        state_change_count=int(state_changes),
+        event_count=int(event_count),
+        median_event_gap=float(median_gap),
+        score=float(score),
     )
+
+
+def _get_byte_cols(df: pd.DataFrame) -> List[str]:
+    byte_cols = df.attrs.get("byte_cols")
+    if not byte_cols:
+        # fallback: discover from columns
+        byte_cols = [c for c in df.columns if isinstance(c, str) and re.match(r"^Byte\d+$", c)]
+        byte_cols = sorted(byte_cols, key=lambda c: int(re.match(r"^Byte(\d+)$", c).group(1)))
+    return byte_cols
 
 
 def find_trigger_candidates(
     df: pd.DataFrame,
     min_events: int = 2,
+    max_events: Optional[int] = None,
+    min_unique: int = 2,
     max_unique: int = 15,
     min_dominant_pct: float = 50.0,
+    edge_seconds: float = 5.0,
+    intertrigger_gap: Optional[float] = None,
+    intertrigger_tol: float = 0.5,
     top_n: int = 20,
 ) -> List[TriggerCandidate]:
     """
     Scan all CAN IDs and bytes to find potential trigger signals.
-    
-    Args:
-        df: Cleaned CAN dataframe
-        min_events: Minimum transition events required
-        max_unique: Maximum unique values allowed
-        min_dominant_pct: Minimum percentage for dominant value
-        top_n: Number of top candidates to return
-    
-    Returns:
-        List of TriggerCandidate objects, sorted by score descending
     """
-    candidates = []
-    
+    candidates: List[TriggerCandidate] = []
+    byte_cols = _get_byte_cols(df)
+
+    # Global test bounds (used by edge filter)
+    test_start = float(df["Timestamp"].min())
+    test_end = float(df["Timestamp"].max())
+
     can_ids = df["CAN_ID"].unique()
-    print(f"Analyzing {len(can_ids)} CAN IDs x 8 bytes = {len(can_ids) * 8} signals...")
-    
+    print(f"Analyzing {len(can_ids)} CAN IDs x {len(byte_cols)} bytes = {len(can_ids) * len(byte_cols)} signals...")
+
     for can_id in can_ids:
         can_id = int(can_id)
         g = df[df["CAN_ID"] == can_id].sort_values("Timestamp")
-        
         if len(g) < 100:
             continue
-        
+
         timestamps = g["Timestamp"].values
-        
-        for byte_num in range(1, 9):
-            byte_col = f"Byte{byte_num}"
+
+        for byte_col in byte_cols:
+            m = re.match(r"^Byte(\d+)$", byte_col)
+            byte_num = int(m.group(1)) if m else -1
             values = g[byte_col].values
-            
+
             candidate = analyze_byte_for_triggers(
                 timestamps=timestamps,
                 values=values,
                 can_id=can_id,
                 byte_num=byte_num,
                 min_events=min_events,
+                max_events=max_events,
+                min_unique=min_unique,
                 max_unique=max_unique,
                 min_dominant_pct=min_dominant_pct,
+                test_start=test_start,
+                test_end=test_end,
+                edge_seconds=edge_seconds,
+                intertrigger_gap=intertrigger_gap,
+                intertrigger_tol=intertrigger_tol,
             )
-            
             if candidate is not None:
                 candidates.append(candidate)
-    
-    # Sort by score descending
+
     candidates.sort(key=lambda c: c.score, reverse=True)
-    
     return candidates[:top_n]
 
 
@@ -255,46 +493,44 @@ def print_candidate_details(df: pd.DataFrame, candidate: TriggerCandidate):
     can_id = candidate.can_id
     byte_num = candidate.byte_num
     byte_col = f"Byte{byte_num}"
-    
+
     g = df[df["CAN_ID"] == can_id].sort_values("Timestamp")
     values = g[byte_col].values
     timestamps = g["Timestamp"].values
-    
-    # Remove NaN
+
     mask = ~np.isnan(values)
     values = values[mask].astype(int)
     timestamps = timestamps[mask]
-    
+
     print(f"\n{'='*60}")
     print(f"CAN ID: {hex(can_id)} | Byte: {byte_num}")
     print(f"{'='*60}")
-    
-    # Value distribution
+
     print(f"\nValue Distribution:")
     unique_vals, counts = np.unique(values, return_counts=True)
+
     for val, cnt in sorted(zip(unique_vals, counts), key=lambda x: -x[1]):
         pct = 100.0 * cnt / len(values)
         marker = " <-- IDLE" if val == candidate.dominant_value else (" <-- ACTIVE" if val in candidate.active_values else "")
         print(f"  {hex(val):>6}: {cnt:6d} ({pct:5.1f}%){marker}")
-    
-    # Find transition times
+
     print(f"\nTransition Events (into active states):")
     prev_values = np.roll(values, 1)
     prev_values[0] = values[0]
-    
+
     is_active = np.isin(values, candidate.active_values)
     was_not_active = ~np.isin(prev_values, candidate.active_values)
     transition_mask = is_active & was_not_active
-    
+
     transition_times = timestamps[transition_mask]
     transition_vals = values[transition_mask]
-    
+
     for i, (t, v) in enumerate(zip(transition_times[:15], transition_vals[:15])):
-        print(f"  {i+1:2d}. t={t:8.3f}s -> {hex(v)}")
-    
+        print(f"  {i+1:2d}. t={t:10.4f}s -> {hex(v)}")
+
     if len(transition_times) > 15:
         print(f"  ... and {len(transition_times) - 15} more")
-    
+
     print(f"\nSuggested usage:")
     if len(candidate.active_values) == 1:
         print(f"  --lka-can-id {hex(can_id)} --trigger-byte {byte_num} --trigger-value {hex(candidate.active_values[0])}")
@@ -304,8 +540,8 @@ def print_candidate_details(df: pd.DataFrame, candidate: TriggerCandidate):
 
 
 def plot_trigger_candidate(
-    df: pd.DataFrame, 
-    candidate: TriggerCandidate, 
+    df: pd.DataFrame,
+    candidate: TriggerCandidate,
     outpath: Optional[str] = None,
     fig_size: Tuple[int, int] = (16, 4),
 ):
@@ -316,50 +552,49 @@ def plot_trigger_candidate(
     can_id = candidate.can_id
     byte_num = candidate.byte_num
     byte_col = f"Byte{byte_num}"
-    
+
     g = df[df["CAN_ID"] == can_id].sort_values("Timestamp")
     values = g[byte_col].values
     timestamps = g["Timestamp"].values
-    
-    # Remove NaN
+
     mask = ~np.isnan(values)
     values = values[mask].astype(int)
     timestamps = timestamps[mask]
-    
+
     if len(values) < 10:
         print(f"Not enough data to plot {hex(can_id)} Byte{byte_num}")
         return
-    
+
     fig, ax = plt.subplots(figsize=fig_size)
-    
-    # Plot the signal
+
     ax.step(timestamps, values, where="post", linewidth=1.2, color="blue", label=f"{hex(can_id)} Byte{byte_num}")
-    
-    # Mark transition events with vertical lines
+
     prev_values = np.roll(values, 1)
     prev_values[0] = values[0]
     is_active = np.isin(values, candidate.active_values)
     was_not_active = ~np.isin(prev_values, candidate.active_values)
     transition_mask = is_active & was_not_active
     transition_times = timestamps[transition_mask]
-    
+
     for t in transition_times:
         ax.axvline(t, color="red", linestyle="--", linewidth=1.0, alpha=0.7)
-    
-    # Add horizontal lines for idle and active values
-    ax.axhline(candidate.dominant_value, color="green", linestyle=":", linewidth=1.0, alpha=0.5, label=f"Idle ({hex(candidate.dominant_value)})")
-    
+
+    ax.axhline(candidate.dominant_value, color="green", linestyle=":", linewidth=1.0, alpha=0.5,
+               label=f"Idle ({hex(candidate.dominant_value)})")
+
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Byte Value")
-    
+
     active_hex = ", ".join(hex(v) for v in candidate.active_values)
-    ax.set_title(f"{hex(can_id)} Byte{byte_num} | Idle={hex(candidate.dominant_value)} ({candidate.dominant_pct:.1f}%) | Active={active_hex} | {candidate.transition_count} transitions")
-    
+    ax.set_title(
+        f"{hex(can_id)} Byte{byte_num} | Idle={hex(candidate.dominant_value)} ({candidate.dominant_pct:.1f}%) "
+        f"| Active={active_hex} | changes={candidate.state_change_count}, events={candidate.event_count}"
+    )
+
     ax.grid(True, linewidth=0.5, alpha=0.5)
     ax.legend(loc="upper right")
-    
     fig.tight_layout()
-    
+
     if outpath:
         fig.savefig(outpath, dpi=150)
         plt.close(fig)
@@ -371,73 +606,84 @@ def plot_can_id_all_bytes(
     df: pd.DataFrame,
     can_id: int,
     outpath: Optional[str] = None,
-    fig_size: Tuple[int, int] = (16, 12),
+    ncols: int = 8,
+    fig_size: Optional[Tuple[int, int]] = None,
 ):
     """
-    Plot all 8 bytes of a CAN ID in a single figure with subplots.
-    Useful for exploring a specific CAN ID to understand its structure.
+    Plot all bytes of a CAN ID in a single figure with subplots.
+    For 64-byte logs, this will produce an 8x8 grid by default.
     """
+    byte_cols = _get_byte_cols(df)
+
     g = df[df["CAN_ID"] == can_id].sort_values("Timestamp")
-    
     if len(g) < 10:
         print(f"Not enough data to plot {hex(can_id)}")
         return
-    
+
     timestamps = g["Timestamp"].values
-    
-    fig, axes = plt.subplots(4, 2, figsize=fig_size, sharex=True)
-    axes = axes.flatten()
-    
-    for byte_num in range(1, 9):
-        ax = axes[byte_num - 1]
-        byte_col = f"Byte{byte_num}"
+
+    nbytes = len(byte_cols)
+    nrows = int(math.ceil(nbytes / ncols))
+
+    if fig_size is None:
+        # heuristic: make each subplot ~3"x2" (clamped a bit)
+        w = max(16, min(3 * ncols, 36))
+        h = max(8, min(2 * nrows, 40))
+        fig_size = (w, h)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=fig_size, sharex=True)
+    axes = np.array(axes).reshape(-1)
+
+    for i, byte_col in enumerate(byte_cols):
+        ax = axes[i]
+        m = re.match(r"^Byte(\d+)$", byte_col)
+        byte_num = int(m.group(1)) if m else i + 1
+
         values = g[byte_col].values
-        
-        # Handle NaN
+
         mask = ~np.isnan(values)
         plot_timestamps = timestamps[mask]
         plot_values = values[mask].astype(int)
-        
+
         if len(plot_values) < 5:
-            ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f"Byte{byte_num}")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes, fontsize=8)
+            ax.set_title(f"Byte{byte_num}", fontsize=9)
+            ax.grid(True, alpha=0.3)
             continue
-        
-        # Get value distribution
+
         unique_vals, counts = np.unique(plot_values, return_counts=True)
         dominant_val = unique_vals[np.argmax(counts)]
         dominant_pct = 100 * np.max(counts) / len(plot_values)
-        
-        # Plot
-        ax.step(plot_timestamps, plot_values, where="post", linewidth=1.0, color="blue")
-        
-        # Mark transitions from dominant value
+
+        ax.step(plot_timestamps, plot_values, where="post", linewidth=0.9, color="blue")
+
         prev = np.roll(plot_values, 1)
         prev[0] = dominant_val
-        trans_mask = (prev == dominant_val) & (plot_values != dominant_val)
-        trans_count = np.sum(trans_mask)
-        
+        trans_mask = plot_values != prev
+        trans_count = int(np.sum(trans_mask))
+
         for t in plot_timestamps[trans_mask]:
-            ax.axvline(t, color="red", linestyle="--", linewidth=0.8, alpha=0.6)
-        
-        # Horizontal line for dominant
-        ax.axhline(dominant_val, color="green", linestyle=":", linewidth=1.0, alpha=0.5)
-        
-        ax.set_ylabel(f"Byte{byte_num}")
+            ax.axvline(t, color="red", linestyle="--", linewidth=0.7, alpha=0.5)
+
+        ax.axhline(dominant_val, color="green", linestyle=":", linewidth=0.9, alpha=0.4)
+
+        unique_str = ", ".join(hex(v) for v in sorted(unique_vals)[:4])
+        if len(unique_vals) > 4:
+            unique_str += ", ..."
+
+        ax.set_title(
+            f"Byte{byte_num}: idle={hex(int(dominant_val))} ({dominant_pct:.0f}%), {trans_count} trans, vals=[{unique_str}]",
+            fontsize=8
+        )
         ax.grid(True, alpha=0.3)
-        
-        # Title with stats
-        unique_str = ", ".join(hex(v) for v in sorted(unique_vals)[:5])
-        if len(unique_vals) > 5:
-            unique_str += "..."
-        ax.set_title(f"Byte{byte_num}: idle={hex(dominant_val)} ({dominant_pct:.0f}%), {trans_count} trans, vals=[{unique_str}]", fontsize=9)
-    
-    axes[-2].set_xlabel("Time (s)")
-    axes[-1].set_xlabel("Time (s)")
-    
-    fig.suptitle(f"CAN ID {hex(can_id)} - All Bytes", fontsize=12, fontweight='bold')
-    fig.tight_layout()
-    
+
+    # Turn off unused axes
+    for j in range(nbytes, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle(f"CAN ID {hex(can_id)} - All Bytes", fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
     if outpath:
         fig.savefig(outpath, dpi=150)
         plt.close(fig)
@@ -457,10 +703,12 @@ def save_candidates_csv(candidates: List[TriggerCandidate], outpath: str):
             "dominant_pct": round(c.dominant_pct, 1),
             "active_values_hex": " ".join(hex(v) for v in c.active_values),
             "num_unique": len(c.unique_values),
-            "transition_count": c.transition_count,
+            "state_change_count": c.state_change_count,
+            "event_count": c.event_count,
+            "median_event_gap": (None if math.isnan(c.median_event_gap) else round(c.median_event_gap, 3)),
             "score": round(c.score, 1),
         })
-    
+
     pd.DataFrame(rows).to_csv(outpath, index=False)
     print(f"\nSaved candidates to: {outpath}")
 
@@ -473,8 +721,7 @@ def parse_hex_arg(val: str) -> int:
     val = val.strip().lower()
     if val.startswith("0x"):
         return int(val, 16)
-    else:
-        return int(val, 16)
+    return int(val, 16)
 
 
 def main():
@@ -484,83 +731,96 @@ def main():
         epilog="""
 Examples:
   python trigger_finder.py --csv data.csv
-  python trigger_finder.py --csv data.csv --min-events 3 --top 30
+  python trigger_finder.py --csv data.csv --min-events 2 --max-events 4 --min-unique 4 --max-unique 6
   python trigger_finder.py --csv data.csv --details 5 --plot 5
   python trigger_finder.py --csv data.csv --force-plot 0x412
-        """
+        """,
     )
     parser.add_argument("--csv", required=True, help="Path to CAN CSV log file")
-    parser.add_argument("--min-events", type=int, default=2, 
-                        help="Minimum number of transition events (default: 2)")
+    parser.add_argument("--min-events", type=int, default=2,
+                        help="Minimum number of state changes (any value change) (default: 2)")
+    parser.add_argument("--max-events", type=int, default=None,
+                        help="Maximum number of state changes allowed (optional; e.g. 4)")
+    parser.add_argument("--min-unique", type=int, default=2,
+                        help="Minimum unique values per byte (default: 2; use 4-5 for multi-state triggers)")
     parser.add_argument("--max-unique", type=int, default=15,
                         help="Maximum unique values per byte (default: 15)")
     parser.add_argument("--min-dominant-pct", type=float, default=50.0,
                         help="Minimum percentage for dominant/idle value (default: 50)")
+    parser.add_argument("--edge-seconds", type=float, default=5.0,
+                    help="Exclude candidates where ALL trigger events occur within the first OR last N seconds of the test (default: 5). Set 0 to disable.")
+    parser.add_argument("--intertrigger-gap", type=float, default=None,
+                        help="If set, require the time between consecutive trigger events to be ~this value (seconds). Example: --intertrigger-gap 3")
+    parser.add_argument("--intertrigger-tol", type=float, default=0.5,
+                        help="Tolerance for --intertrigger-gap in seconds (default: 0.5).")
     parser.add_argument("--top", type=int, default=20,
                         help="Number of top candidates to show (default: 20)")
     parser.add_argument("--details", type=int, default=5,
                         help="Number of candidates to show detailed analysis for (default: 5)")
     parser.add_argument("--plot", type=int, default=5,
                         help="Number of top candidates to plot (default: 5)")
-    parser.add_argument("--force-plot", type=str, nargs='+', default=None,
+    parser.add_argument("--force-plot", type=str, nargs="+", default=None,
                         help="Force plot specific CAN IDs (hex, e.g., 0x412 or '0x412 0xD5')")
     parser.add_argument("--outdir", type=str, default=None,
                         help="Output directory for plots (default: trigger_finder_results/<csv_name>)")
     parser.add_argument("--outcsv", type=str, default=None,
                         help="Path to save candidates CSV (optional)")
-    
+    parser.add_argument("--expected-bytes", type=int, default=None,
+                        help="If set, forces Byte1..ByteN to exist (useful for 64-byte logs).")
+
     args = parser.parse_args()
-    
+
     # Load data
-    df = load_and_clean_csv(args.csv)
-    
+    df = load_and_clean_csv(args.csv, expected_n_bytes=args.expected_bytes)
+
     # Find candidates
     candidates = find_trigger_candidates(
         df=df,
         min_events=args.min_events,
+        max_events=args.max_events,
+        min_unique=args.min_unique,
         max_unique=args.max_unique,
         min_dominant_pct=args.min_dominant_pct,
+        edge_seconds=args.edge_seconds,
+        intertrigger_gap=args.intertrigger_gap,
+        intertrigger_tol=args.intertrigger_tol,
         top_n=args.top,
     )
-    
+
     if not candidates:
         print("No trigger candidates found with current settings.")
         print("Try lowering --min-events or --min-dominant-pct")
         return
-    
-    # Print summary
+
     print(f"\n{'='*60}")
     print(f"TOP {len(candidates)} TRIGGER CANDIDATES")
     print(f"{'='*60}")
     for i, c in enumerate(candidates):
         print(f"{i+1:2d}. {c}")
-    
-    # Print details for top N
-    print(f"\n\nDETAILED ANALYSIS (top {args.details}):")
+
+    print(f"\n\nDETAILED ANALYSIS (top {min(args.details, len(candidates))}):")
     for c in candidates[:args.details]:
         print_candidate_details(df, c)
-    
+
     # Setup output directory for plots
     if args.outdir:
         plot_outdir = args.outdir
     else:
         base = os.path.splitext(os.path.basename(args.csv))[0]
         plot_outdir = os.path.join("trigger_finder_results", base)
-    
+
     os.makedirs(plot_outdir, exist_ok=True)
-    
+    clear_directory(plot_outdir)
+
     # Plot top candidates
     if args.plot > 0:
         print(f"\n\nPLOTTING top {min(args.plot, len(candidates))} candidates to: {plot_outdir}")
         for i, c in enumerate(candidates[:args.plot]):
-            outpath = os.path.join(
-                plot_outdir, 
-                f"candidate_{i+1:02d}_{c.can_id:03x}_byte{c.byte_num}.png"
-            )
+            outpath = os.path.join(plot_outdir, f"candidate_{i+1:02d}_{c.can_id:03x}_byte{c.byte_num}.png")
             plot_trigger_candidate(df, c, outpath=outpath)
             print(f"  Saved: {outpath}")
-    
-    # Force plot specific CAN IDs (all 8 bytes)
+
+    # Force plot specific CAN IDs (all bytes)
     if args.force_plot:
         print(f"\n\nFORCE PLOTTING specified CAN IDs:")
         for can_id_str in args.force_plot:
@@ -569,7 +829,7 @@ Examples:
             outpath = os.path.join(plot_outdir, f"force_{can_id:03x}_all_bytes.png")
             plot_can_id_all_bytes(df, can_id, outpath=outpath)
             print(f"    Saved: {outpath}")
-    
+
     # Save to CSV
     if args.outcsv:
         save_candidates_csv(candidates, args.outcsv)
