@@ -14,14 +14,8 @@ from plotting_utils import (
     plot_candidate_with_trigger_overlay,
     u16_to_i16,
 )
-from multi_byte_decoder import explore_decode_space_for_targets, decode_series_from_row, describe_decode
-from nearby_id_explorer import explore_nearby_ids
-
-# =========================
-# Config
-# =========================
-BYTE_COLS = [f"Byte{i}" for i in range(1, 9)]
-
+# from multi_byte_decoder import explore_decode_space_for_targets, decode_series_from_row, describe_decode
+# from nearby_id_explorer import explore_nearby_ids
 
 # =========================
 # Helpers: parse + conversions
@@ -34,9 +28,22 @@ def hex_to_int(x):
     if pd.isna(x):
         return np.nan
 
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+
+    if isinstance(x, (float, np.floating)):
+        if np.isnan(x):
+            return np.nan
+        if float(x).is_integer():
+            return int(x)
+        return np.nan
+
     s = str(x).strip()
     if s == "" or s.lower() == "errorframe":
         return np.nan
+
+    if re.fullmatch(r"\d+\.0+", s):
+        return int(float(s))
 
     s = s.replace("0x", "").replace("0X", "")
     valid = all(ch in "0123456789abcdefABCDEF" for ch in s)
@@ -65,13 +72,15 @@ def parse_hex_args(vals: List[str]) -> List[int]:
     return [parse_hex_arg(v) for v in vals]
 
 
-def compute_u16_series_from_group(g: pd.DataFrame, offset: int, endian: str) -> np.ndarray:
+def compute_u16_series_from_group(g: pd.DataFrame, offset: int, endian: str, byte_cols: List[str] = None) -> np.ndarray:
     """
     Vectorized u16 extraction from Byte[offset] and Byte[offset+1] columns.
     Returns numpy array length == len(g), with NaNs preserved.
     """
-    b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-    b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
+    if byte_cols is None:
+        byte_cols = g.attrs.get("byte_cols", [f"Byte{i}" for i in range(1, 9)])
+    b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+    b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
 
     out = np.full(len(g), np.nan, dtype=np.float64)
 
@@ -93,37 +102,81 @@ def compute_u16_series_from_group(g: pd.DataFrame, offset: int, endian: str) -> 
 # =========================
 # Load + clean CSV
 # =========================
-def load_and_clean_csv(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+def find_header_row(csv_path: str, max_scan: int = 15) -> int:
+    """Scan first N lines to find the row containing actual column headers."""
+    with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+        for i, line in enumerate(f):
+            if i >= max_scan:
+                break
+            if "Time" in line and "Data0" in line:
+                return i
+    return 0
 
-    # Count ErrorFrame rows
-    if "Identifier" in df.columns:
-        errorframe_count = (df["Identifier"].astype(str).str.strip().str.lower() == "errorframe").sum()
-    else:
-        errorframe_count = 0
+
+def load_and_clean_csv(csv_path: str) -> pd.DataFrame:
+    header_row = find_header_row(csv_path)
+    df = pd.read_csv(csv_path, skiprows=header_row, dtype=str, low_memory=False)
+
+    # Strip whitespace from column names
+    df.columns = [c.strip() for c in df.columns]
+
+    # Rename Data0-Data63 → Byte1-Byte64
+    rename_map = {}
+    for i in range(64):
+        old_name = f"Data{i}"
+        if old_name in df.columns:
+            rename_map[old_name] = f"Byte{i + 1}"
+    df = df.rename(columns=rename_map)
+
+    # Detect byte columns
+    byte_cols = sorted(
+        [c for c in df.columns if re.match(r"^Byte\d+$", c)],
+        key=lambda c: int(re.match(r"^Byte(\d+)$", c).group(1)),
+    )
+
+    # Detect ID column
+    id_col = None
+    for candidate in ["id", "Identifier", "ID"]:
+        if candidate in df.columns:
+            id_col = candidate
+            break
+    if id_col is None:
+        raise ValueError(f"Cannot find CAN ID column. Columns: {list(df.columns)}")
+
+    # Detect time column
+    time_col = None
+    for candidate in ["Time", "Timestamp"]:
+        if candidate in df.columns:
+            time_col = candidate
+            break
+    if time_col is None:
+        raise ValueError(f"Cannot find time column. Columns: {list(df.columns)}")
 
     print(f"Loaded: {csv_path}")
+    print(f"Header row: {header_row}")
     print(f"Rows (raw): {len(df)}")
-    print(f"ErrorFrame rows found: {errorframe_count}")
+    print(f"ID column: {id_col!r}, Time column: {time_col!r}")
+    print(f"Detected {len(byte_cols)} byte columns")
 
     # Parse CAN ID
-    df["CAN_ID"] = df["Identifier"].apply(hex_to_int)
+    df["CAN_ID"] = df[id_col].apply(hex_to_int)
 
     # Parse bytes
-    for c in BYTE_COLS:
-        if c in df.columns:
-            df[c] = df[c].apply(hex_to_int).astype(float)
-        else:
-            df[c] = np.nan
+    for c in byte_cols:
+        df[c] = df[c].apply(hex_to_int).astype(float)
 
     # Parse timestamp
-    df["Timestamp"] = pd.to_numeric(df["Timestamp"], errors="coerce")
+    df["Timestamp"] = pd.to_numeric(df[time_col], errors="coerce")
 
     # Clean
     df = df.dropna(subset=["Timestamp", "CAN_ID"]).sort_values("Timestamp").reset_index(drop=True)
 
+    # Store byte_cols for downstream use
+    df.attrs["byte_cols"] = byte_cols
+
     print(f"Rows after cleaning: {len(df)}")
     print(f"Unique CAN IDs: {df['CAN_ID'].nunique()}")
+    print(f"Time range: {df['Timestamp'].min():.4f}s - {df['Timestamp'].max():.4f}s")
 
     return df
 
@@ -134,12 +187,12 @@ def load_and_clean_csv(csv_path: str) -> pd.DataFrame:
 def compute_trigger_bytes(df: pd.DataFrame, lka_id: int, trigger_byte: int) -> pd.DataFrame:
     """
     Extract trigger byte values for the specified LKA CAN ID.
-    
+
     Args:
         df: Full CAN dataframe
         lka_id: The CAN ID to use as trigger (e.g., 0x670)
-        trigger_byte: Which byte (1-8) contains the trigger value
-    
+        trigger_byte: Which byte (1-64) contains the trigger value
+
     Returns:
         DataFrame with Timestamp and trigger byte state
     """
@@ -180,11 +233,13 @@ def u16_series_for_candidate(df, can_id_dec, byte_pair_str, endian):
     b1 = int(byte_pair_str.split("Byte")[1].split(",")[0])  # 1-based
     offset = b1 - 1
 
+    byte_cols = df.attrs.get("byte_cols", [f"Byte{i}" for i in range(1, 9)])
+
     g = df[df["CAN_ID"] == int(can_id_dec)].copy().sort_values("Timestamp")
     if g.empty:
         return None
 
-    u16 = compute_u16_series_from_group(g, offset, endian)
+    u16 = compute_u16_series_from_group(g, offset, endian, byte_cols=byte_cols)
     out = pd.DataFrame({"Timestamp": g["Timestamp"].values, "u16": u16}).dropna()
     return out if len(out) > 10 else None
         
@@ -258,8 +313,8 @@ Examples:
     # New parameterized trigger arguments
     parser.add_argument("--lka-can-id", required=True, 
                         help="CAN ID for LKA trigger (hex, e.g., 0x670 or 670)")
-    parser.add_argument("--trigger-byte", type=int, required=True, choices=range(1, 9),
-                        help="Which byte (1-8) contains the trigger value")
+    parser.add_argument("--trigger-byte", type=int, required=True, choices=range(1, 65),
+                        help="Which byte (1-64) contains the trigger value")
     parser.add_argument("--trigger-value", required=True, nargs='+',
                     help="Value(s) that indicate trigger ON (hex, e.g., 0x11 or '0x11 0x44' for multiple)")
     
@@ -311,13 +366,15 @@ Examples:
     print(f"Saved trigger plot: {trigger_plot_path}")
 
     # Candidate scoring - exclude_id=None to INCLUDE the trigger CAN ID in search
+    byte_cols = df.attrs.get("byte_cols", [f"Byte{i}" for i in range(1, 9)])
     cands = build_candidates_multi_event_relaxed(
         df=df,
         on_events=on_events,
-        exclude_id=None,  
+        exclude_id=None,
         pre_window=args.pre,
         post_window=args.post,
         top_n=args.topn,
+        byte_cols=byte_cols,
     )
 
     if cands.empty:
@@ -451,26 +508,26 @@ Examples:
 
     print(f"Saved {len(cands_unique)} candidate plots to: {test_outdir}")
 
-    # =======================
-    # NEARBY ID EXPLORATION 
-    # =======================
-    print("\n" + "="*40)
-    print("NEARBY ID EXHAUSTIVE EXPLORATION")
-    print("="*40)
+    # # =======================
+    # # NEARBY ID EXPLORATION 
+    # # =======================
+    # print("\n" + "="*40)
+    # print("NEARBY ID EXHAUSTIVE EXPLORATION")
+    # print("="*40)
     
-    nearby_outdir = os.path.join(test_outdir, "nearby_ids")
+    # nearby_outdir = os.path.join(test_outdir, "nearby_ids")
     
-    explore_nearby_ids(
-        df=df,
-        target_id=lka_id,  # Use the LKA ID as center
-        range_offset=5,     # Explore ±5 IDs
-        trigger_df=trigger_df,
-        lka_id=lka_id,
-        trigger_byte=trigger_byte,
-        trigger_values=trigger_values,
-        outdir=nearby_outdir,
-        smooth=False,  # Set to False if you want raw plots
-    )
+    # explore_nearby_ids(
+    #     df=df,
+    #     target_id=lka_id,  # Use the LKA ID as center
+    #     range_offset=5,     # Explore ±5 IDs
+    #     trigger_df=trigger_df,
+    #     lka_id=lka_id,
+    #     trigger_byte=trigger_byte,
+    #     trigger_values=trigger_values,
+    #     outdir=nearby_outdir,
+    #     smooth=False,  # Set to False if you want raw plots
+    # )
 
 
 if __name__ == "__main__":

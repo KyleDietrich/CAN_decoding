@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 
 # =========================
@@ -94,29 +95,12 @@ def hex_to_int(x):
         return np.nan
 
 
-    s = str(x).strip()
-    if s == "" or s.lower() == "errorframe":
-        return np.nan
-
-    # common "0x" prefix
-    s = s.replace("0x", "").replace("0X", "")
-
-    # allow plain decimal '0' style
-    # If it's purely digits, treat as hex anyway (works for 0-9)
-    if not all(ch in "0123456789abcdefABCDEF" for ch in s):
-        return np.nan
-
-    try:
-        return int(s, 16)
-    except Exception:
-        return np.nan
-
-
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize column names so we can robustly detect id/time/byte columns.
     - Strips whitespace
     - Converts 'Byte 1' -> 'Byte1'
+    - Converts 'Data0' -> 'Byte1', 'Data1' -> 'Byte2', etc. (CAN FD format)
     - Keeps 'Unnamed: x' columns as-is
     """
     rename = {}
@@ -126,16 +110,15 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         c0 = c
         c1 = c.strip()
 
-        # Some headers in your sample have tabs embedded (e.g. 'Arb.ID\\tTime\\tData')
-        # We keep it as one column name, but normalize whitespace a bit.
         c1 = re.sub(r"\s+", " ", c1)
 
-        m = re.match(r"^(?i:byte)\s*(\d+)$", c1)
+        # DataN → Byte(N+1) for CAN FD format
+        m = re.match(r"^(?i:data)\s*(\d+)$", c1)
         if m:
-            rename[c0] = f"Byte{int(m.group(1))}"
+            rename[c0] = f"Byte{int(m.group(1)) + 1}"
             continue
 
-        m = re.match(r"^(?i:byte)\s+(\d+)$", c1)
+        m = re.match(r"^(?i:byte)\s*(\d+)$", c1)
         if m:
             rename[c0] = f"Byte{int(m.group(1))}"
             continue
@@ -164,7 +147,7 @@ def _detect_id_time_cols(df: pd.DataFrame) -> Tuple[str, str]:
             cl = c.lower()
             if "arb" in cl and "id" in cl:
                 candidates.append(c)
-            elif cl in {"can_id", "canid", "id", "arb.id", "arb_id"}:
+            elif cl in {"can_id", "canid", "id", "arb.id", "arb_id", "identifier"}:
                 candidates.append(c)
         id_col = candidates[0] if candidates else cols[0]
 
@@ -217,9 +200,21 @@ def _detect_byte_cols(df: pd.DataFrame, expected_n_bytes: Optional[int] = None) 
     return byte_cols
 
 
+def _find_header_row(csv_path: str, max_scan: int = 15) -> int:
+    """Scan first N lines to find the row containing actual column headers."""
+    with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+        for i, line in enumerate(f):
+            if i >= max_scan:
+                break
+            if "Time" in line and "Data0" in line:
+                return i
+    return 0
+
+
 def load_and_clean_csv(csv_path: str, expected_n_bytes: Optional[int] = None) -> pd.DataFrame:
     """Load and clean CAN CSV data."""
-    df = pd.read_csv(csv_path, dtype=str, low_memory=False)
+    header_row = _find_header_row(csv_path)
+    df = pd.read_csv(csv_path, skiprows=header_row, dtype=str, low_memory=False)
 
     df = _normalize_columns(df)
     id_col, time_col = _detect_id_time_cols(df)
@@ -273,18 +268,27 @@ class TriggerCandidate:
     event_count: int
     median_event_gap: float
     score: float
+    trigger_match_rate: float = 0.0
+    bit_num: Optional[int] = None
+    analysis_type: str = "byte"
 
     def __str__(self):
         active_hex = [hex(v) for v in self.active_values]
         gap_str = "n/a" if math.isnan(self.median_event_gap) else f"{self.median_event_gap:.2f}s"
+        match_str = f", match={self.trigger_match_rate:.0%}" if self.trigger_match_rate > 0 else ""
+        if self.bit_num is not None:
+            label = f"CAN {hex(self.can_id)} Byte{self.byte_num} Bit{self.bit_num}"
+        else:
+            label = f"CAN {hex(self.can_id)} Byte{self.byte_num}"
         return (
-            f"CAN {hex(self.can_id)} Byte{self.byte_num}: "
+            f"{label}: "
             f"idle={hex(self.dominant_value)} ({self.dominant_pct:.1f}%), "
             f"active={active_hex}, "
             f"changes={self.state_change_count}, "
             f"events={self.event_count}, "
             f"gap~{gap_str}, "
             f"score={self.score:.1f}"
+            f"{match_str}"
         )
 
 
@@ -304,6 +308,9 @@ def analyze_byte_for_triggers(
     edge_seconds: float = 5.0,
     intertrigger_gap: Optional[float] = None,
     intertrigger_tol: float = 0.5,
+    known_trigger_times: Optional[List[float]] = None,
+    trigger_window: float = 3.0,
+    **kwargs,
 ) -> Optional[TriggerCandidate]:
     """
     Analyze a single byte stream to see if it looks like a trigger signal.
@@ -397,12 +404,35 @@ def analyze_byte_for_triggers(
         if np.any(gaps < min_allowed):
             return None
 
+    # -----------------------------------------
+    # 5) Optional: filter by known trigger times
+    # -----------------------------------------
+    trigger_match_rate = 0.0
+    if known_trigger_times is not None and len(known_trigger_times) > 0:
+        # For each known trigger time, check if any state change occurs within ±trigger_window
+        change_times = timestamps[change_mask]
+        matched = 0
+        for kt in known_trigger_times:
+            if np.any(np.abs(change_times - kt) <= trigger_window):
+                matched += 1
+        trigger_match_rate = matched / len(known_trigger_times)
+
+        # Require minimum match rate (configurable via min_trigger_match_rate param)
+        min_rate = kwargs.get("min_trigger_match_rate", 1.0)
+        if trigger_match_rate < min_rate:
+            return None
+
     # Score: favor (reasonable) number of state changes + strong idle dominance + fewer unique states
     score = (
         min(state_changes, 40) * 5
         + dominant_pct * 0.5
         - len(unique_vals) * 2
     )
+
+    if known_trigger_times is not None and len(known_trigger_times) > 0:
+        score += trigger_match_rate * 200
+        if trigger_match_rate >= 1.0:
+            score += 50
 
     return TriggerCandidate(
         can_id=int(can_id),
@@ -415,7 +445,72 @@ def analyze_byte_for_triggers(
         event_count=int(event_count),
         median_event_gap=float(median_gap),
         score=float(score),
+        trigger_match_rate=float(trigger_match_rate),
     )
+
+
+def analyze_bit_for_triggers(
+    timestamps: np.ndarray,
+    byte_values: np.ndarray,
+    can_id: int,
+    byte_num: int,
+    bit_num: int,
+    min_events: int = 2,
+    max_events: Optional[int] = None,
+    test_start: Optional[float] = None,
+    test_end: Optional[float] = None,
+    edge_seconds: float = 5.0,
+    intertrigger_gap: Optional[float] = None,
+    intertrigger_tol: float = 0.5,
+    known_trigger_times: Optional[List[float]] = None,
+    trigger_window: float = 3.0,
+    **kwargs,
+) -> Optional[TriggerCandidate]:
+    """
+    Extract a single bit from byte_values and analyze as a binary trigger.
+    bit_num: 0 (LSB) to 7 (MSB).
+    """
+    mask = ~np.isnan(byte_values)
+    byte_clean = byte_values[mask].astype(int)
+    ts_clean = timestamps[mask]
+
+    if len(byte_clean) < 100:
+        return None
+
+    # Extract bit: 0 or 1
+    bit_values = ((byte_clean >> bit_num) & 1).astype(float)
+
+    # Must have both 0s and 1s
+    if len(np.unique(bit_values[~np.isnan(bit_values)].astype(int))) < 2:
+        return None
+
+    candidate = analyze_byte_for_triggers(
+        timestamps=ts_clean,
+        values=bit_values,
+        can_id=can_id,
+        byte_num=byte_num,
+        min_events=min_events,
+        max_events=max_events,
+        min_unique=2,
+        max_unique=2,
+        min_dominant_pct=50.0,
+        test_start=test_start,
+        test_end=test_end,
+        edge_seconds=edge_seconds,
+        intertrigger_gap=intertrigger_gap,
+        intertrigger_tol=intertrigger_tol,
+        known_trigger_times=known_trigger_times,
+        trigger_window=trigger_window,
+        **kwargs,
+    )
+
+    if candidate is None:
+        return None
+
+    candidate.bit_num = bit_num
+    candidate.analysis_type = "bit"
+
+    return candidate
 
 
 def _get_byte_cols(df: pd.DataFrame) -> List[str]:
@@ -432,25 +527,44 @@ def find_trigger_candidates(
     min_events: int = 2,
     max_events: Optional[int] = None,
     min_unique: int = 2,
-    max_unique: int = 15,
+    max_unique: Optional[int] = None,
     min_dominant_pct: float = 50.0,
-    edge_seconds: float = 5.0,
+    edge_seconds: Optional[float] = None,
     intertrigger_gap: Optional[float] = None,
     intertrigger_tol: float = 0.5,
     top_n: int = 20,
+    known_trigger_times: Optional[List[float]] = None,
+    trigger_window: float = 3.0,
+    enable_bit_analysis: bool = True,
+    min_trigger_match_rate: float = 1.0,
 ) -> List[TriggerCandidate]:
     """
     Scan all CAN IDs and bytes to find potential trigger signals.
+    Includes bit-level analysis for CAN FD data.
     """
     candidates: List[TriggerCandidate] = []
     byte_cols = _get_byte_cols(df)
+    n_bytes = len(byte_cols)
+
+    # Adaptive max_unique: CAN 2.0 (<=8 bytes) -> 15, CAN FD -> 256
+    if max_unique is None:
+        max_unique = 15 if n_bytes <= 8 else 256
 
     # Global test bounds (used by edge filter)
     test_start = float(df["Timestamp"].min())
     test_end = float(df["Timestamp"].max())
+    duration = test_end - test_start
+
+    # Adaptive edge_seconds: 5% of test duration, clamped to [1.0, 10.0]
+    if edge_seconds is None:
+        edge_seconds = max(1.0, min(duration * 0.05, 10.0))
 
     can_ids = df["CAN_ID"].unique()
-    print(f"Analyzing {len(can_ids)} CAN IDs x {len(byte_cols)} bytes = {len(can_ids) * len(byte_cols)} signals...")
+    bit_note = " + bit-level" if enable_bit_analysis else ""
+    print(f"Analyzing {len(can_ids)} CAN IDs x {n_bytes} bytes = {len(can_ids) * n_bytes} signals{bit_note}...")
+    print(f"  max_unique={max_unique}, edge_seconds={edge_seconds:.1f}s (test duration={duration:.1f}s)")
+
+    extra_kwargs = {"min_trigger_match_rate": min_trigger_match_rate}
 
     for can_id in can_ids:
         can_id = int(can_id)
@@ -465,6 +579,7 @@ def find_trigger_candidates(
             byte_num = int(m.group(1)) if m else -1
             values = g[byte_col].values
 
+            # --- Byte-level analysis ---
             candidate = analyze_byte_for_triggers(
                 timestamps=timestamps,
                 values=values,
@@ -480,30 +595,84 @@ def find_trigger_candidates(
                 edge_seconds=edge_seconds,
                 intertrigger_gap=intertrigger_gap,
                 intertrigger_tol=intertrigger_tol,
+                known_trigger_times=known_trigger_times,
+                trigger_window=trigger_window,
+                **extra_kwargs,
             )
             if candidate is not None:
                 candidates.append(candidate)
 
+            # --- Bit-level analysis ---
+            if enable_bit_analysis:
+                clean = values[~np.isnan(values)]
+                if len(clean) < 100:
+                    continue
+                n_unique = len(np.unique(clean.astype(int)))
+                if n_unique < 2:
+                    continue
+
+                # Run bit analysis when trigger times are known OR byte-level was too noisy
+                run_bits = (known_trigger_times is not None) or (n_unique > max_unique)
+                if run_bits:
+                    for bit in range(8):
+                        bit_cand = analyze_bit_for_triggers(
+                            timestamps=timestamps,
+                            byte_values=values,
+                            can_id=can_id,
+                            byte_num=byte_num,
+                            bit_num=bit,
+                            min_events=min_events,
+                            max_events=max_events,
+                            test_start=test_start,
+                            test_end=test_end,
+                            edge_seconds=edge_seconds,
+                            intertrigger_gap=intertrigger_gap,
+                            intertrigger_tol=intertrigger_tol,
+                            known_trigger_times=known_trigger_times,
+                            trigger_window=trigger_window,
+                            **extra_kwargs,
+                        )
+                        if bit_cand is not None:
+                            candidates.append(bit_cand)
+
     candidates.sort(key=lambda c: c.score, reverse=True)
     return candidates[:top_n]
+
+
+def _extract_candidate_values(df: pd.DataFrame, candidate: TriggerCandidate):
+    """Extract timestamps and values for a candidate (byte-level or bit-level)."""
+    can_id = candidate.can_id
+    byte_num = candidate.byte_num
+    byte_col = f"Byte{byte_num}"
+
+    g = df[df["CAN_ID"] == can_id].sort_values("Timestamp")
+    raw_values = g[byte_col].values
+    timestamps = g["Timestamp"].values
+
+    mask = ~np.isnan(raw_values)
+    byte_clean = raw_values[mask].astype(int)
+    ts_clean = timestamps[mask]
+
+    if candidate.bit_num is not None:
+        values = (byte_clean >> candidate.bit_num) & 1
+    else:
+        values = byte_clean
+
+    return ts_clean, values
 
 
 def print_candidate_details(df: pd.DataFrame, candidate: TriggerCandidate):
     """Print detailed analysis of a trigger candidate."""
     can_id = candidate.can_id
     byte_num = candidate.byte_num
-    byte_col = f"Byte{byte_num}"
 
-    g = df[df["CAN_ID"] == can_id].sort_values("Timestamp")
-    values = g[byte_col].values
-    timestamps = g["Timestamp"].values
-
-    mask = ~np.isnan(values)
-    values = values[mask].astype(int)
-    timestamps = timestamps[mask]
+    timestamps, values = _extract_candidate_values(df, candidate)
 
     print(f"\n{'='*60}")
-    print(f"CAN ID: {hex(can_id)} | Byte: {byte_num}")
+    if candidate.bit_num is not None:
+        print(f"CAN ID: {hex(can_id)} | Byte: {byte_num} | Bit: {candidate.bit_num} (bit-level)")
+    else:
+        print(f"CAN ID: {hex(can_id)} | Byte: {byte_num}")
     print(f"{'='*60}")
 
     print(f"\nValue Distribution:")
@@ -531,8 +700,15 @@ def print_candidate_details(df: pd.DataFrame, candidate: TriggerCandidate):
     if len(transition_times) > 15:
         print(f"  ... and {len(transition_times) - 15} more")
 
+    if candidate.trigger_match_rate > 0:
+        print(f"\nTrigger Match Rate: {candidate.trigger_match_rate:.0%}")
+
     print(f"\nSuggested usage:")
-    if len(candidate.active_values) == 1:
+    if candidate.bit_num is not None:
+        # For bit-level: user still needs to use byte + value, but we show the bit info
+        print(f"  (Bit-level trigger: Byte{byte_num} Bit{candidate.bit_num})")
+        print(f"  --lka-can-id {hex(can_id)} --trigger-byte {byte_num} --trigger-value {hex(candidate.active_values[0])}")
+    elif len(candidate.active_values) == 1:
         print(f"  --lka-can-id {hex(can_id)} --trigger-byte {byte_num} --trigger-value {hex(candidate.active_values[0])}")
     else:
         active_hex = " ".join(hex(v) for v in candidate.active_values)
@@ -547,27 +723,28 @@ def plot_trigger_candidate(
 ):
     """
     Plot the trigger candidate signal over time.
-    Shows the byte value with idle and active regions highlighted.
+    Shows the byte/bit value with idle and active regions highlighted.
     """
     can_id = candidate.can_id
     byte_num = candidate.byte_num
-    byte_col = f"Byte{byte_num}"
 
-    g = df[df["CAN_ID"] == can_id].sort_values("Timestamp")
-    values = g[byte_col].values
-    timestamps = g["Timestamp"].values
-
-    mask = ~np.isnan(values)
-    values = values[mask].astype(int)
-    timestamps = timestamps[mask]
+    timestamps, values = _extract_candidate_values(df, candidate)
 
     if len(values) < 10:
-        print(f"Not enough data to plot {hex(can_id)} Byte{byte_num}")
+        label = str(candidate).split(":")[0]
+        print(f"Not enough data to plot {label}")
         return
+
+    if candidate.bit_num is not None:
+        signal_label = f"{hex(can_id)} Byte{byte_num} Bit{candidate.bit_num}"
+        y_label = "Bit Value"
+    else:
+        signal_label = f"{hex(can_id)} Byte{byte_num}"
+        y_label = "Byte Value"
 
     fig, ax = plt.subplots(figsize=fig_size)
 
-    ax.step(timestamps, values, where="post", linewidth=1.2, color="blue", label=f"{hex(can_id)} Byte{byte_num}")
+    ax.step(timestamps, values, where="post", linewidth=1.2, color="blue", label=signal_label)
 
     prev_values = np.roll(values, 1)
     prev_values[0] = values[0]
@@ -583,14 +760,18 @@ def plot_trigger_candidate(
                label=f"Idle ({hex(candidate.dominant_value)})")
 
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Byte Value")
+    ax.set_ylabel(y_label)
 
     active_hex = ", ".join(hex(v) for v in candidate.active_values)
     ax.set_title(
-        f"{hex(can_id)} Byte{byte_num} | Idle={hex(candidate.dominant_value)} ({candidate.dominant_pct:.1f}%) "
+        f"{signal_label} | Idle={hex(candidate.dominant_value)} ({candidate.dominant_pct:.1f}%) "
         f"| Active={active_hex} | changes={candidate.state_change_count}, events={candidate.event_count}"
     )
 
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(5))
+    ax.xaxis.set_minor_locator(mticker.MultipleLocator(1))
+    ax.tick_params(axis="x", which="minor", length=4)
+    ax.tick_params(axis="x", which="major", length=7)
     ax.grid(True, linewidth=0.5, alpha=0.5)
     ax.legend(loc="upper right")
     fig.tight_layout()
@@ -681,6 +862,13 @@ def plot_can_id_all_bytes(
     for j in range(nbytes, len(axes)):
         axes[j].axis("off")
 
+    # Set x-axis ticks: dash every 1s, number every 5s
+    for ax in axes[:nbytes]:
+        ax.xaxis.set_major_locator(mticker.MultipleLocator(5))
+        ax.xaxis.set_minor_locator(mticker.MultipleLocator(1))
+        ax.tick_params(axis="x", which="minor", length=4)
+        ax.tick_params(axis="x", which="major", length=7)
+
     fig.suptitle(f"CAN ID {hex(can_id)} - All Bytes", fontsize=12, fontweight="bold")
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
@@ -699,6 +887,8 @@ def save_candidates_csv(candidates: List[TriggerCandidate], outpath: str):
             "can_id_hex": hex(c.can_id),
             "can_id_dec": c.can_id,
             "byte_num": c.byte_num,
+            "bit_num": c.bit_num,
+            "analysis_type": c.analysis_type,
             "dominant_value_hex": hex(c.dominant_value),
             "dominant_pct": round(c.dominant_pct, 1),
             "active_values_hex": " ".join(hex(v) for v in c.active_values),
@@ -706,6 +896,7 @@ def save_candidates_csv(candidates: List[TriggerCandidate], outpath: str):
             "state_change_count": c.state_change_count,
             "event_count": c.event_count,
             "median_event_gap": (None if math.isnan(c.median_event_gap) else round(c.median_event_gap, 3)),
+            "trigger_match_rate": round(c.trigger_match_rate, 2) if c.trigger_match_rate > 0 else None,
             "score": round(c.score, 1),
         })
 
@@ -743,12 +934,12 @@ Examples:
                         help="Maximum number of state changes allowed (optional; e.g. 4)")
     parser.add_argument("--min-unique", type=int, default=2,
                         help="Minimum unique values per byte (default: 2; use 4-5 for multi-state triggers)")
-    parser.add_argument("--max-unique", type=int, default=15,
-                        help="Maximum unique values per byte (default: 15)")
+    parser.add_argument("--max-unique", type=int, default=None,
+                        help="Maximum unique values per byte (default: auto -- 15 for CAN 2.0, 256 for CAN FD)")
     parser.add_argument("--min-dominant-pct", type=float, default=50.0,
                         help="Minimum percentage for dominant/idle value (default: 50)")
-    parser.add_argument("--edge-seconds", type=float, default=5.0,
-                    help="Exclude candidates where ALL trigger events occur within the first OR last N seconds of the test (default: 5). Set 0 to disable.")
+    parser.add_argument("--edge-seconds", type=float, default=None,
+                    help="Exclude candidates where ALL trigger events occur within the first OR last N seconds (default: auto -- 5%% of test duration). Set 0 to disable.")
     parser.add_argument("--intertrigger-gap", type=float, default=None,
                         help="If set, require the time between consecutive trigger events to be ~this value (seconds). Example: --intertrigger-gap 3")
     parser.add_argument("--intertrigger-tol", type=float, default=0.5,
@@ -765,8 +956,17 @@ Examples:
                         help="Output directory for plots (default: trigger_finder_results/<csv_name>)")
     parser.add_argument("--outcsv", type=str, default=None,
                         help="Path to save candidates CSV (optional)")
+    parser.add_argument("--trigger-times", type=float, nargs="+", default=None,
+                        help="Known trigger timestamps in seconds (e.g., --trigger-times 19 37 55). "
+                             "Only candidates with state changes near these times will be kept.")
+    parser.add_argument("--trigger-window", type=float, default=3.0,
+                        help="Window (±seconds) around each --trigger-times to look for state changes (default: 3.0)")
     parser.add_argument("--expected-bytes", type=int, default=None,
                         help="If set, forces Byte1..ByteN to exist (useful for 64-byte logs).")
+    parser.add_argument("--no-bit-analysis", action="store_true", default=False,
+                        help="Disable bit-level trigger analysis (faster but may miss bit-encoded triggers)")
+    parser.add_argument("--min-trigger-match", type=float, default=1.0,
+                        help="Minimum fraction of --trigger-times that must match state changes (default: 1.0 = all must match)")
 
     args = parser.parse_args()
 
@@ -774,6 +974,11 @@ Examples:
     df = load_and_clean_csv(args.csv, expected_n_bytes=args.expected_bytes)
 
     # Find candidates
+    if args.trigger_times:
+        print(f"Known trigger times: {args.trigger_times}")
+        print(f"Trigger window: ±{args.trigger_window}s")
+        print()
+
     candidates = find_trigger_candidates(
         df=df,
         min_events=args.min_events,
@@ -785,6 +990,10 @@ Examples:
         intertrigger_gap=args.intertrigger_gap,
         intertrigger_tol=args.intertrigger_tol,
         top_n=args.top,
+        known_trigger_times=args.trigger_times,
+        trigger_window=args.trigger_window,
+        enable_bit_analysis=not args.no_bit_analysis,
+        min_trigger_match_rate=args.min_trigger_match,
     )
 
     if not candidates:

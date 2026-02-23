@@ -23,7 +23,16 @@ import numpy as np
 import pandas as pd
 from plotting_utils import plot_candidate_with_trigger_overlay
 
-BYTE_COLS = [f"Byte{i}" for i in range(1, 9)]
+import re
+
+
+def _get_byte_cols(df: pd.DataFrame) -> List[str]:
+    """Get byte columns from df.attrs or discover from column names."""
+    byte_cols = df.attrs.get("byte_cols")
+    if not byte_cols:
+        byte_cols = [c for c in df.columns if isinstance(c, str) and re.match(r"^Byte\d+$", c)]
+        byte_cols = sorted(byte_cols, key=lambda c: int(re.match(r"^Byte(\d+)$", c).group(1)))
+    return byte_cols
 
 
 # =========================
@@ -136,6 +145,7 @@ def build_series_for_config(df: pd.DataFrame, can_id: int, cfg: Dict[str, Any]) 
     """
     Build a DataFrame with [Timestamp, unsigned, signed] for any decode config.
     """
+    byte_cols = _get_byte_cols(df)
     kind = cfg["kind"]
     start_byte = cfg["start_byte"]
     endian = cfg["endian"]
@@ -146,11 +156,11 @@ def build_series_for_config(df: pd.DataFrame, can_id: int, cfg: Dict[str, Any]) 
 
     if kind == "u16/i16":
         offset = int(start_byte) - 1
-        if offset < 0 or offset > 6:
+        if offset < 0 or offset >= len(byte_cols) - 1:
             return None
 
-        b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-        b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
+        b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+        b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
 
         u16 = decode_u16_from_bytes(b0, b1, endian)
         i16 = u16_to_i16(u16)
@@ -164,12 +174,12 @@ def build_series_for_config(df: pd.DataFrame, can_id: int, cfg: Dict[str, Any]) 
 
     elif kind == "u24/i24":
         offset = int(start_byte) - 1
-        if offset < 0 or offset > 5:
+        if offset < 0 or offset >= len(byte_cols) - 2:
             return None
 
-        b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-        b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
-        b2 = g[BYTE_COLS[offset + 2]].to_numpy(dtype=np.float64)
+        b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+        b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
+        b2 = g[byte_cols[offset + 2]].to_numpy(dtype=np.float64)
 
         u24 = decode_u24_from_bytes(b0, b1, b2, endian)
         i24 = u24_to_i24(u24)
@@ -183,13 +193,13 @@ def build_series_for_config(df: pd.DataFrame, can_id: int, cfg: Dict[str, Any]) 
 
     elif kind == "u32/i32":
         offset = int(start_byte) - 1
-        if offset < 0 or offset > 4:
+        if offset < 0 or offset >= len(byte_cols) - 3:
             return None
 
-        b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-        b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
-        b2 = g[BYTE_COLS[offset + 2]].to_numpy(dtype=np.float64)
-        b3 = g[BYTE_COLS[offset + 3]].to_numpy(dtype=np.float64)
+        b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+        b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
+        b2 = g[byte_cols[offset + 2]].to_numpy(dtype=np.float64)
+        b3 = g[byte_cols[offset + 3]].to_numpy(dtype=np.float64)
 
         u32 = decode_u32_from_bytes(b0, b1, b2, b3, endian)
         i32 = u32_to_i32(u32)
@@ -202,25 +212,22 @@ def build_series_for_config(df: pd.DataFrame, can_id: int, cfg: Dict[str, Any]) 
         return out if len(out) >= 30 else None
 
     elif kind == "bitfield":
-        # Bitfield from u16
         offset = int(start_byte) - 1
-        if offset < 0 or offset > 6:
+        if offset < 0 or offset >= len(byte_cols) - 1:
             return None
 
-        b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-        b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
+        b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+        b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
 
         u16 = decode_u16_from_bytes(b0, b1, endian)
-        
-        # Decode unsigned
+
         unsigned_vals = []
         for val in u16:
             if np.isnan(val):
                 unsigned_vals.append(np.nan)
             else:
                 unsigned_vals.append(float(decode_bitfield_from_u16(int(val), cfg["bit_shift"], cfg["bit_len"], signed=False)))
-        
-        # Decode signed
+
         signed_vals = []
         for val in u16:
             if np.isnan(val):
@@ -237,8 +244,10 @@ def build_series_for_config(df: pd.DataFrame, can_id: int, cfg: Dict[str, Any]) 
 
     elif kind == "single_byte":
         byte_num = int(start_byte)
-        byte_col = BYTE_COLS[byte_num - 1]
-        
+        if byte_num < 1 or byte_num > len(byte_cols):
+            return None
+        byte_col = byte_cols[byte_num - 1]
+
         byte_vals = g[byte_col].to_numpy(dtype=np.float64)
         i8_vals = np.where(byte_vals >= 128, byte_vals - 256, byte_vals)
 
@@ -255,51 +264,12 @@ def build_series_for_config(df: pd.DataFrame, can_id: int, cfg: Dict[str, Any]) 
 # =========================
 # Config generators
 # =========================
-def generate_all_configs() -> List[Dict[str, Any]]:
+def generate_all_configs(n_bytes: int = 8) -> List[Dict[str, Any]]:
     """Generate ALL possible decode configs: single-byte, 2-byte, 3-byte, 4-byte, bitfields."""
     configs = []
 
-    # # Single bytes (Byte1 through Byte8)
-    # for byte_num in range(1, 9):
-    #     configs.append({
-    #         "kind": "single_byte",
-    #         "start_byte": byte_num,
-    #         "endian": "N/A",
-    #         "label": f"Byte{byte_num}"
-    #     })
-
-    # # 2-byte (Byte1-2 through Byte7-8)
-    # for start_byte in range(1, 8):
-    #     for endian in ["little", "big"]:
-    #         configs.append({
-    #             "kind": "u16/i16",
-    #             "start_byte": start_byte,
-    #             "endian": endian,
-    #             "label": f"u16_Byte{start_byte}_{endian}"
-    #         })
-
-    # # 3-byte (Byte1-3 through Byte6-8)
-    # for start_byte in range(1, 7):
-    #     for endian in ["little", "big"]:
-    #         configs.append({
-    #             "kind": "u24/i24",
-    #             "start_byte": start_byte,
-    #             "endian": endian,
-    #             "label": f"u24_Byte{start_byte}_{endian}"
-    #         })
-
-    # # 4-byte (Byte1-4 through Byte5-8)
-    # for start_byte in range(1, 6):
-    #     for endian in ["little", "big"]:
-    #         configs.append({
-    #             "kind": "u32/i32",
-    #             "start_byte": start_byte,
-    #             "endian": endian,
-    #             "label": f"u32_Byte{start_byte}_{endian}"
-    #         })
-
     # Bitfields (reasonable subset)
-    for start_byte in range(1, 8):
+    for start_byte in range(1, n_bytes):
         for endian in ["little", "big"]:
             for bit_len in [8, 10, 12, 14]:
                 for bit_shift in [0, 2, 4, 6]:
@@ -372,7 +342,8 @@ def explore_nearby_ids(
     print(f"  Target position: index {target_idx} (±{range_offset} neighbors)")
 
     # Generate all decode configs
-    all_configs = generate_all_configs()
+    byte_cols = _get_byte_cols(df)
+    all_configs = generate_all_configs(n_bytes=len(byte_cols))
     print(f"  Total decode configs per ID: {len(all_configs)}")
     print(f"  Total plots to generate: {len(target_ids) * len(all_configs)}")
 

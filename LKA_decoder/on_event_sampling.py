@@ -9,7 +9,16 @@ import pandas as pd
 # Default list (you can override when calling functions)
 DEFAULT_TARGET_IDS = [0x126, 0x220]
 
-BYTE_COLS = [f"Byte{i}" for i in range(1, 9)]
+import re
+
+
+def _get_byte_cols(df: pd.DataFrame) -> List[str]:
+    """Get byte columns from df.attrs or discover from column names."""
+    byte_cols = df.attrs.get("byte_cols")
+    if not byte_cols:
+        byte_cols = [c for c in df.columns if isinstance(c, str) and re.match(r"^Byte\d+$", c)]
+        byte_cols = sorted(byte_cols, key=lambda c: int(re.match(r"^Byte(\d+)$", c).group(1)))
+    return byte_cols
 
 
 # =========================
@@ -32,13 +41,15 @@ def parse_byte_pair(byte_pair_str: str) -> int:
     return b1 - 1  # convert to 0-based offset
 
 
-def compute_u16_series_from_group(g: pd.DataFrame, offset: int, endian: str) -> np.ndarray:
+def compute_u16_series_from_group(g: pd.DataFrame, offset: int, endian: str, byte_cols: List[str] = None) -> np.ndarray:
     """
     Vectorized u16 extraction from Byte[offset] and Byte[offset+1].
     Returns numpy array length == len(g), with NaNs preserved.
     """
-    b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-    b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
+    if byte_cols is None:
+        byte_cols = _get_byte_cols(g)
+    b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+    b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
 
     out = np.full(len(g), np.nan, dtype=np.float64)
 
@@ -172,7 +183,8 @@ def build_on_event_sample_table(
         best_score = np.inf
 
         # Try every bytepair + endian
-        for offset in range(0, 7):
+        byte_cols = _get_byte_cols(df)
+        for offset in range(0, len(byte_cols) - 1):
             byte_pair = f"(Byte{offset+1},Byte{offset+2})"
 
             for endian in ["little", "big"]:

@@ -20,10 +20,19 @@ import numpy as np
 import pandas as pd
 
 
+import re
+
+
 # -------------------------
-# Byte column naming
+# Byte column helpers
 # -------------------------
-BYTE_COLS = [f"Byte{i}" for i in range(1, 9)]
+def _get_byte_cols(df: pd.DataFrame) -> List[str]:
+    """Get byte columns from df.attrs or discover from column names."""
+    byte_cols = df.attrs.get("byte_cols")
+    if not byte_cols:
+        byte_cols = [c for c in df.columns if isinstance(c, str) and re.match(r"^Byte\d+$", c)]
+        byte_cols = sorted(byte_cols, key=lambda c: int(re.match(r"^Byte(\d+)$", c).group(1)))
+    return byte_cols
 
 
 # =========================
@@ -136,20 +145,21 @@ def decode_bitfield_from_u16(u16_val: int, bit_shift: int, bit_len: int, signed:
 # =========================
 def build_u16_series(df: pd.DataFrame, can_id: int, start_byte: int, endian: str) -> Optional[pd.DataFrame]:
     """
-    start_byte is 1-based: 1..7
+    start_byte is 1-based: 1..N-1
     uses Byte[start_byte] + Byte[start_byte+1]
     returns DataFrame: Timestamp, u16
     """
+    byte_cols = _get_byte_cols(df)
     g = df[df["CAN_ID"] == int(can_id)].copy().sort_values("Timestamp")
     if g.empty:
         return None
 
     offset = int(start_byte) - 1
-    if offset < 0 or offset > 6:
+    if offset < 0 or offset >= len(byte_cols) - 1:
         return None
 
-    b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-    b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
+    b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+    b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
 
     u16 = decode_u16_from_bytes(b0, b1, endian=endian)
     out = pd.DataFrame({"Timestamp": g["Timestamp"].values, "u16": u16}).dropna()
@@ -167,21 +177,22 @@ def build_i16_series(df: pd.DataFrame, can_id: int, start_byte: int, endian: str
 
 def build_u24_series(df: pd.DataFrame, can_id: int, start_byte: int, endian: str) -> Optional[pd.DataFrame]:
     """
-    start_byte is 1-based: 1..6
+    start_byte is 1-based: 1..N-2
     uses Byte[start_byte] + Byte[start_byte+1] + Byte[start_byte+2]
     returns DataFrame: Timestamp, u24
     """
+    byte_cols = _get_byte_cols(df)
     g = df[df["CAN_ID"] == int(can_id)].copy().sort_values("Timestamp")
     if g.empty:
         return None
 
     offset = int(start_byte) - 1
-    if offset < 0 or offset > 5:
+    if offset < 0 or offset >= len(byte_cols) - 2:
         return None
 
-    b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-    b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
-    b2 = g[BYTE_COLS[offset + 2]].to_numpy(dtype=np.float64)
+    b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+    b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
+    b2 = g[byte_cols[offset + 2]].to_numpy(dtype=np.float64)
 
     u24 = decode_u24_from_bytes(b0, b1, b2, endian=endian)
     out = pd.DataFrame({"Timestamp": g["Timestamp"].values, "u24": u24}).dropna()
@@ -366,23 +377,24 @@ def score_series_around_events(
 # =========================
 # Candidate generators
 # =========================
-def generate_2byte_decode_configs() -> List[Dict[str, Any]]:
+def generate_2byte_decode_configs(n_bytes: int = 8) -> List[Dict[str, Any]]:
     cfgs = []
-    for start_byte in range(1, 8):  # Byte1..Byte7
+    for start_byte in range(1, n_bytes):  # Byte1..Byte(N-1)
         for endian in ["little", "big"]:
             cfgs.append({"kind": "u16/i16", "start_byte": start_byte, "endian": endian})
     return cfgs
 
 
-def generate_3byte_decode_configs() -> List[Dict[str, Any]]:
+def generate_3byte_decode_configs(n_bytes: int = 8) -> List[Dict[str, Any]]:
     cfgs = []
-    for start_byte in range(1, 7):  # Byte1..Byte6
+    for start_byte in range(1, n_bytes - 1):  # Byte1..Byte(N-2)
         for endian in ["little", "big"]:
             cfgs.append({"kind": "u24/i24", "start_byte": start_byte, "endian": endian})
     return cfgs
 
 
 def generate_bitfield_decode_configs(
+    n_bytes: int = 8,
     bit_lens: List[int] = [8, 10, 12, 13, 14, 15],
     bit_shifts: List[int] = [0, 1, 2, 3, 4, 5, 6, 7],
     signed: bool = True,
@@ -392,7 +404,7 @@ def generate_bitfield_decode_configs(
     Defaults focus on reasonable field sizes for "distance-ish" signals.
     """
     cfgs = []
-    for start_byte in range(1, 8):
+    for start_byte in range(1, n_bytes):
         for endian in ["little", "big"]:
             for bit_len in bit_lens:
                 for bit_shift in bit_shifts:
@@ -531,14 +543,17 @@ def explore_decode_space_for_id(
     if n_rows == 0:
         return pd.DataFrame()
 
+    byte_cols = _get_byte_cols(df)
+    n_bytes = len(byte_cols)
+
     configs: List[Dict[str, Any]] = []
 
     if include_2byte:
-        configs.extend(generate_2byte_decode_configs())
+        configs.extend(generate_2byte_decode_configs(n_bytes=n_bytes))
     if include_3byte:
-        configs.extend(generate_3byte_decode_configs())
+        configs.extend(generate_3byte_decode_configs(n_bytes=n_bytes))
     if include_bitfields:
-        configs.extend(generate_bitfield_decode_configs(signed=bitfield_signed))
+        configs.extend(generate_bitfield_decode_configs(n_bytes=n_bytes, signed=bitfield_signed))
 
     results = []
 

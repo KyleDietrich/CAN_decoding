@@ -5,24 +5,33 @@ from typing import List, Optional, Dict
 import numpy as np
 import pandas as pd
 
-BYTE_COLS = [f"Byte{i}" for i in range(1, 9)]
+import re
 
 
 # =========================
-# Decode helpers 
+# Decode helpers
 # =========================
+def _get_byte_cols(df: pd.DataFrame) -> List[str]:
+    """Get byte columns from df.attrs or discover from column names."""
+    byte_cols = df.attrs.get("byte_cols")
+    if not byte_cols:
+        byte_cols = [c for c in df.columns if isinstance(c, str) and re.match(r"^Byte\d+$", c)]
+        byte_cols = sorted(byte_cols, key=lambda c: int(re.match(r"^Byte(\d+)$", c).group(1)))
+    return byte_cols
 def u16_to_i16(u16_vals: np.ndarray) -> np.ndarray:
     u = np.asarray(u16_vals, dtype=np.float64)
     return np.where(u >= 32768, u - 65536, u)
 
 
-def compute_u16_series_from_group(g: pd.DataFrame, offset: int, endian: str) -> np.ndarray:
+def compute_u16_series_from_group(g: pd.DataFrame, offset: int, endian: str, byte_cols: List[str] = None) -> np.ndarray:
     """
     Vectorized u16 extraction from Byte[offset] and Byte[offset+1].
     Returns numpy array length == len(g), with NaNs preserved.
     """
-    b0 = g[BYTE_COLS[offset]].to_numpy(dtype=np.float64)
-    b1 = g[BYTE_COLS[offset + 1]].to_numpy(dtype=np.float64)
+    if byte_cols is None:
+        byte_cols = _get_byte_cols(g)
+    b0 = g[byte_cols[offset]].to_numpy(dtype=np.float64)
+    b1 = g[byte_cols[offset + 1]].to_numpy(dtype=np.float64)
 
     out = np.full(len(g), np.nan, dtype=np.float64)
 
@@ -105,16 +114,19 @@ def get_i16_series_for_candidate(
     df: pd.DataFrame,
     can_id_dec: int,
     offset: int,
-    endian: str
+    endian: str,
+    byte_cols: List[str] = None,
 ) -> Optional[pd.DataFrame]:
     """
     Decode candidate as signed i16 from a CAN ID + byte offset + endian.
     """
+    if byte_cols is None:
+        byte_cols = _get_byte_cols(df)
     g = df[df["CAN_ID"] == int(can_id_dec)].copy().sort_values("Timestamp")
     if g.empty or len(g) < 80:
         return None
 
-    u16 = compute_u16_series_from_group(g, offset, endian)
+    u16 = compute_u16_series_from_group(g, offset, endian, byte_cols=byte_cols)
     i16 = u16_to_i16(u16)
 
     out = pd.DataFrame({"Timestamp": g["Timestamp"].values, "i16": i16}).dropna()
@@ -131,10 +143,11 @@ def build_candidates_multi_event_relaxed(
     pre_window: float = 20.0,
     post_window: float = 20.0,
     top_n: int = 25,
+    byte_cols: List[str] = None,
 ) -> pd.DataFrame:
     """
     Rank CAN_ID + bytepair + endian candidates based on activity AFTER trigger ON events.
-    
+
     Args:
         df: Full CAN dataframe
         on_events: List of trigger event timestamps
@@ -142,7 +155,11 @@ def build_candidates_multi_event_relaxed(
         pre_window: Seconds before trigger to analyze
         post_window: Seconds after trigger to analyze
         top_n: Number of top candidates to return
+        byte_cols: List of byte column names (e.g. ["Byte1", ..., "Byte64"])
     """
+    if byte_cols is None:
+        byte_cols = _get_byte_cols(df)
+
     if len(on_events) == 0:
         raise ValueError("No ON events found (trigger ON list is empty).")
 
@@ -156,10 +173,10 @@ def build_candidates_multi_event_relaxed(
         if len(g) < 150:
             continue
 
-        for offset in range(0, 7):
+        for offset in range(0, len(byte_cols) - 1):
             for endian in ["little", "big"]:
 
-                s = get_i16_series_for_candidate(df, int(can_id), offset, endian)
+                s = get_i16_series_for_candidate(df, int(can_id), offset, endian, byte_cols=byte_cols)
                 if s is None:
                     continue
 
