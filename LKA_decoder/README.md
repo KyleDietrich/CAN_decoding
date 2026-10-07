@@ -1,225 +1,105 @@
-# LKA Distance-to-Lane CAN Decoder (RAM 4500)
+# LKA Decoder
 
-This project is a Python-based workflow for **finding and visualizing the CAN signal that represents “distance to lane”** using a known LKA trigger message as a reference. 
+Python scripts for reverse-engineering Lane Keep Assist (LKA) signals from CAN logs.
 
-**ONLY TESTED ON A RAM 4500**
+The workflow has two steps:
 
-We use CAN ID **0x275** (LKA trigger states) to detect when Lane Keep Assist becomes active, then search all other CAN messages for signals that become “alive” after that trigger.
-
-The goal is to narrow down candidate CAN IDs / byte pairs that behave like a distance-to-lane measurement signal.
-
----
-
-## What This Script Does
-
-Given a CAN log CSV, the script:
-
-### 1) Loads and cleans CAN data
-
-- Reads the CSV exported from your CAN tool
-- Converts:
-  - CAN Identifier hex → integer CAN ID
-  - Byte1–Byte8 hex → numeric
-  - Timestamp → numeric float
-- Removes invalid rows (missing timestamp / invalid CAN_ID)
-
-### 2) Extracts the LKA trigger states (CAN ID `0x275`)
-
-From ID **0x275** it pulls:
-
-- `Byte2_state`
-- `Byte7_state`
-
-These bytes appear to represent LKA trigger/command states.
-
-### 3) Detects ON events
-
-An “ON event” is defined as:
-
-- `Byte7_state` transitioning into **0x04**
-
-These ON timestamps become our alignment reference.
-
-### 4) Scores candidate signals across the full CAN bus
-
-For each CAN ID (excluding `0x275`), the script tests:
-
-Every 2-byte window (Byte1–Byte2 ... Byte7–Byte8)  
-Both byte orders:
-
-- **little endian**
-- **big endian**
-
-Each candidate is scored by comparing activity:
-
-- **before** trigger ON
-- **after** trigger ON
-
-A good candidate is:
-
-- significantly more active after ON
-- reasonably consistent across multiple ON events
-- not a pure counter / reset-like jump signal
-
-### 5) Generates clear plots for candidates
-
-For each top candidate, the script produces one plot showing:
-
-- Candidate interpretation as **unsigned u16** (red)
-- Candidate interpretation as **signed i16** (yellow)
-- Trigger signal overlay from **0x275 Byte7** (dark blue) on a 2nd axis
-
-Plots cover **the entire test duration** (full timeline).
-
-### 6) Always plots CAN ID `0x126`
-
-Even if it does not rank in the top candidate list, the script forces a plot for **CAN ID 0x126**, since testing suggests this ID may contain the distance-to-lane signal.
+1. **Find the trigger** – `trigger_finder.py` searches the log for the CAN ID / byte that changes when LKA activates.
+2. **Find the distance-to-lane signal** – `distance_to_lane_decoder.py` uses that trigger to find signals that "wake up" right after LKA turns on.
 
 ---
 
-## Repository Contents
-
-Typical structure:
-
-```plaintext
-truck_CAN_decode/
-├── distance_to_lane_decoder.py
-├── README.md
-└── lka_results/
-    ├── Test_4/
-    │   ├── trigger_states_whole_test.png
-    │   ├── top_candidates.csv
-    │   ├── cand_00_...
-    │   ├── cand_01_...
-    │   └── FORCED_126_...
-    └── Test_5/
-        └── ...
-```
-
----
-
-## Requirements
-
-Install dependencies:
+## Setup
 
 ```bash
 pip install numpy pandas matplotlib
 ```
 
-Recommended: run inside a venv
+### Input CSV
 
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install numpy pandas matplotlib
-```
+The scripts expect a CAN log exported to CSV with:
+
+- a CAN ID column (`id`, `Identifier`, or `ID`)
+- a time column (`Time` or `Timestamp`, in seconds)
+- data byte columns (`Data0`–`Data63` or `Byte1`–`Byte64`), as hex values
+
+Both classic CAN (8 bytes) and CAN FD (up to 64 bytes) logs work.
 
 ---
 
-## Running the Script
-
-Example:
+## Step 1: Find the Trigger
 
 ```bash
-python distance_to_lane_decoder.py --csv "/path/to/Ram 4500 Test 4.csv"
+python trigger_finder.py --csv "path/to/test.csv"
 ```
 
-Optional arguments:
+It looks for bytes (and single bits) that sit at one idle value most of the time and change only a few times, which is how an LKA status signal usually behaves.
+
+Useful options:
+
+| Argument | What it does |
+| --- | --- |
+| `--trigger-times 19 37 55` | Only keep candidates that change near these known times (seconds) |
+| `--min-events` / `--max-events` | Limit how many times the value can change |
+| `--min-unique` / `--max-unique` | Limit how many different values the byte can have |
+| `--force-plot 0x412` | Plot all bytes of a specific CAN ID |
+| `--plot 5` | Number of top candidates to plot |
+
+Run `python trigger_finder.py -h` for the full list.
+
+**Output:** `trigger_finder_results/<csv_name>/` with candidate plots and `trigger_candidates.csv`.
+
+---
+
+## Step 2: Find the Distance-to-Lane Signal
 
 ```bash
-python distance_to_lane_decoder.py \
-  --csv "/path/to/Test 4.csv" \
-  --outdir "lka_results" \
-  --topn 25 \
-  --pre 10 \
-  --post 10
+python distance_to_lane_decoder.py --csv "path/to/test.csv" \
+  --lka-can-id 0x275 --trigger-byte 7 --trigger-value 0x04
 ```
-
-### CLI Arguments
 
 | Argument | Description | Default |
-| --------- | ------------- | --------- |
-| `--csv` | Path to CAN log CSV | **required** |
-| `--outdir` | Root folder for output plots/results | `lka_results` |
-| `--topn` | Number of top candidates to keep | `25` |
-| `--pre` | Pre-trigger window (seconds) for scoring | `10.0` |
-| `--post` | Post-trigger window (seconds) for scoring | `10.0` |
+| --- | --- | --- |
+| `--csv` | Path to the CAN log | **required** |
+| `--lka-can-id` | CAN ID of the trigger (hex) | **required** |
+| `--trigger-byte` | Byte number (1–64) holding the trigger | **required** |
+| `--trigger-value` | Value(s) that mean "LKA on" (hex, can list several) | **required** |
+| `--outdir` | Output folder | `lka_results` |
+| `--topn` | Number of candidates to keep | `25` |
+| `--pre` | Seconds before each trigger to score | `8` |
+| `--post` | Seconds after each trigger to score | `8` |
+
+### How it works
+
+1. Finds every time the trigger byte switches **into** one of the trigger values (an "ON event").
+2. For every CAN ID, it tries every pair of neighboring bytes, both little and big endian.
+3. Each pair is scored on how much more active it is **after** ON than **before**, and how consistent that is across all ON events. Counter-like signals are filtered out.
+4. The best byte pair for each CAN ID is plotted over the whole test.
+
+### Output
+
+Results go to `lka_results/<Test_N>/` (the folder is cleared on each run):
+
+- `trigger_states_whole_test.png` – the trigger byte with ON events marked
+- `top_candidates.csv` – ranked candidates with their scores
+- `cand_XX_<id>_<bytes>_<endian>.png` – candidate as unsigned (red) and signed (gold), with the trigger overlaid (blue)
+- `cand_XX_..._smoothed.png` – same plot with a rolling-average filter
 
 ---
 
-## Output Files
+## Files
 
-Each run creates a per-test folder under `lka_results/`.
+| File | Purpose |
+| --- | --- |
+| `trigger_finder.py` | Step 1: find the LKA trigger ID/byte |
+| `distance_to_lane_decoder.py` | Step 2: score and plot distance-to-lane candidates |
+| `candidate_scoring.py` | Scoring logic used by step 2 |
+| `plotting_utils.py` | Shared plotting functions |
+| `multi_byte_decoder.py` | Optional deeper search (3-byte values and bitfields) |
+| `nearby_id_explorer.py` | Optional: plots every decode format for CAN IDs near a target ID |
+| `on_event_sampling.py` | Helpers for sampling signal values at ON events |
 
-If the folder already exists, it is cleared and replaced with the new output.
-
-Inside the test folder you will find:
-
-### `trigger_states_whole_test.png`
-
-A step plot of:
-
-- `0x275 Byte2`
-- `0x275 Byte7`
-
-With ON events marked.
-
-### `top_candidates.csv`
-
-The ranked candidate table (after scoring) including:
-
-- CAN ID
-- byte pair
-- endianness
-- activity score after ON
-- activity score before ON
-- gain ratio
-- consistency factor
-- final score
-
-### `cand_XX_*.png`
-
-Candidate plots for the ranked list (deduped to one best row per CAN ID).
-
-### `FORCED_126_*.png`
-
-A forced plot for CAN ID **0x126** (best scoring byte-pair/endian if available, otherwise fallback).
+The deep decode and nearby-ID searches are commented out in `distance_to_lane_decoder.py` by default. Uncomment those blocks in `main()` to run them.
 
 ---
 
-## How Candidate Scoring Works (High Level)
-
-For each candidate (CAN ID + byte pair + endian):
-
-1. Extract the candidate as an `int16` signal
-2. For each ON event:
-   - collect pre-window and post-window segments
-   - compute an “activity score”:
-     - `activity = range_p95_p5 * change_fraction`
-3. Compute:
-   - `post_activity_median`
-   - `pre_activity_median`
-   - `gain = post / pre` (capped)
-   - `consistency` across events
-4. Final score:
-   - `final = post_median * gain * consistency`
-
-This tends to surface signals that “wake up” right when LKA activates.
-
----
-
-## Notes / Current Findings
-
-Across testing:
-
-- CAN ID **0x220** appeared often in early scoring runs
-- CAN ID **0x102** appears in some tests
-- CAN ID **0x126** has emerged as a strong candidate and visually resembles expected distance behavior in multiple trials
-
-Because of that, 0x126 is always plotted for every test.
-
----
-
-## Project Context
-
-This script is built for CAN decoding experiments on a RAM 4500, using LKA trigger state CAN messages to reverse-engineer the distance-to-lane signal.
